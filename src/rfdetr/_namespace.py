@@ -49,6 +49,9 @@ _MC_NAMESPACE_FIELDS = {
     "sa_nheads",
     "segmentation_head",
     "two_stage",
+    # Pose estimation fields (present only in pose ModelConfig subclasses)
+    "pose_head",
+    "num_keypoints",
 }
 
 # TrainConfig fields NOT forwarded to the legacy namespace.
@@ -138,6 +141,10 @@ def _namespace_from_configs(
         else mc.cls_loss_coef
     )
 
+    # Only forward pose/keypoints fields that exist on the config object to
+    # avoid KeyError when building non-pose models.
+    mc_fields_to_dump = set(_MC_NAMESPACE_FIELDS) & set(mc.model_fields)
+
     return types.SimpleNamespace(
         **{
             # Architectural defaults — 35 constants not exposed in ModelConfig/TrainConfig.
@@ -148,11 +155,19 @@ def _namespace_from_configs(
             **tc.model_dump(include=set(_TC_NAMESPACE_FIELDS)),
             # ModelConfig: wins over tc for overlapping architecture params
             # (group_detr, ia_bce_loss, segmentation_head, num_select).
-            **mc.model_dump(include=set(_MC_NAMESPACE_FIELDS)),
+            **mc.model_dump(include=mc_fields_to_dump),
             # Segmentation extras (SegmentationTrainConfig only — absent from base TrainConfig).
             "mask_ce_loss_coef": getattr(tc, "mask_ce_loss_coef", 5.0),
             "mask_dice_loss_coef": getattr(tc, "mask_dice_loss_coef", 5.0),
             "mask_point_sample_ratio": getattr(tc, "mask_point_sample_ratio", 16),
+            # Pose extras (PoseTrainConfig only — absent from base TrainConfig).
+            "keypoint_loss_coef": getattr(tc, "keypoint_loss_coef", 5.0),
+            "oks_loss_coef": getattr(tc, "oks_loss_coef", 2.0),
+            "vis_loss_coef": getattr(tc, "vis_loss_coef", 1.0),
+            "set_cost_oks": getattr(tc, "set_cost_oks", 0.0),
+            # Pose head defaults (base ModelConfig has no pose_head field)
+            "pose_head": getattr(mc, "pose_head", False),
+            "num_keypoints": getattr(mc, "num_keypoints", 17),
             # Transformations: fields requiring a default sentinel or transitional priority.
             "cls_loss_coef": cls_loss_coef,
             "resume": tc.resume or "",

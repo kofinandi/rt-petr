@@ -26,6 +26,7 @@ except ImportError:  # pragma: no cover - exercised in unit tests via monkeypatc
 from rfdetr.config import ModelConfig, TrainConfig
 from rfdetr.training.callbacks import (
     BestModelCallback,
+    COCOPoseEvalCallback,
     DropPathCallback,
     RFDETREarlyStopping,
     RFDETREMACallback,
@@ -214,6 +215,15 @@ def build_trainer(
             log_per_class_metrics=tc.log_per_class_metrics,
         )
     )
+
+    # COCO pose (OKS-based keypoint AP) evaluation — added when pose_head is active.
+    if getattr(model_config, "pose_head", False):
+        callbacks.append(
+            COCOPoseEvalCallback(
+                eval_interval=tc.eval_interval,
+                max_dets=20,  # COCO standard: max 20 detections per image for keypoints
+            )
+        )
 
     # Latest resume checkpoint — overwritten every epoch.
     # Skip when checkpoint_interval == 1 to avoid duplicate ModelCheckpoint state_key.

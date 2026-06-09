@@ -17,11 +17,18 @@ from rfdetr.utilities import box_ops
 
 
 class PostProcess(nn.Module):
-    """This module converts the model's output into the format expected by the coco api."""
+    """This module converts the model's output into the format expected by the coco api.
 
-    def __init__(self, num_select=300) -> None:
+    Args:
+        num_select: Maximum number of detections returned per image.
+        pose_head: When ``True``, also gather and denormalise the top-K
+            keypoint predictions emitted by the pose head.
+    """
+
+    def __init__(self, num_select: int = 300, pose_head: bool = False) -> None:
         super().__init__()
         self.num_select = num_select
+        self.pose_head = pose_head
 
     @torch.no_grad()
     def forward(self, outputs, target_sizes):
@@ -34,6 +41,7 @@ class PostProcess(nn.Module):
         """
         out_logits, out_bbox = outputs["pred_logits"], outputs["pred_boxes"]
         out_masks = outputs.get("pred_masks", None)
+        out_keypoints = outputs.get("pred_keypoints", None)  # (B, Q, K, 3) or None
 
         assert len(out_logits) == len(target_sizes)
         assert target_sizes.shape[1] == 2
@@ -75,5 +83,27 @@ class PostProcess(nn.Module):
             results = [
                 {"scores": score, "labels": label, "boxes": box} for score, label, box in zip(scores, labels, boxes)
             ]
+
+        # Gather and denormalise keypoints when pose_head is active
+        if out_keypoints is not None:
+            # out_keypoints: (B, Q, K, 3) with (x,y) in [0,1]
+            for i, res_i in enumerate(results):
+                k_idx = topk_boxes[i]  # (num_select,)
+                # Gather the matching query keypoints
+                kpts_i = out_keypoints[i]  # (Q, K, 3)
+                k, kd = kpts_i.shape[1], kpts_i.shape[2]
+                kpts_sel = torch.gather(
+                    kpts_i,
+                    0,
+                    k_idx.unsqueeze(-1).unsqueeze(-1).expand(-1, k, kd),
+                )  # (num_select, K, 3)
+                # Denormalise x, y to absolute pixel coordinates
+                h_i, w_i = target_sizes[i][0].item(), target_sizes[i][1].item()
+                kpts_sel = kpts_sel.clone()
+                kpts_sel[:, :, 0] *= w_i
+                kpts_sel[:, :, 1] *= h_i
+                # Convert visibility logit → probability
+                kpts_sel[:, :, 2] = kpts_sel[:, :, 2].sigmoid()
+                res_i["keypoints"] = kpts_sel  # (num_select, K, 3): (x,y,vis_prob)
 
         return results

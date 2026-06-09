@@ -17,6 +17,8 @@
 # ------------------------------------------------------------------------
 """Modules to compute the matching cost and solve the corresponding LSAP."""
 
+from typing import Optional
+
 import numpy as np
 import torch
 import torch.nn.functional as F  # noqa: N812
@@ -27,8 +29,96 @@ from rfdetr.models.heads.segmentation import point_sample
 from rfdetr.utilities.box_ops import batch_dice_loss, batch_sigmoid_ce_loss, box_cxcywh_to_xyxy, generalized_box_iou
 from rfdetr.utilities.logger import get_logger
 
+# COCO per-keypoint sigma values (shape: [K])
+_COCO_KPT_SIGMAS = torch.tensor(
+    [
+        0.026,
+        0.025,
+        0.025,
+        0.035,
+        0.035,
+        0.079,
+        0.079,
+        0.072,
+        0.072,
+        0.062,
+        0.062,
+        0.107,
+        0.107,
+        0.087,
+        0.087,
+        0.089,
+        0.089,
+    ],
+    dtype=torch.float32,
+)
+
 logger = get_logger()
 _SANITIZED_COST_MARGIN = 1.0
+
+
+def batch_oks_cost(
+    pred_kpts: torch.Tensor,
+    tgt_kpts: torch.Tensor,
+    tgt_boxes: torch.Tensor,
+    sigmas: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Compute pairwise OKS cost between predicted and target keypoints.
+
+    Returns ``1 - OKS`` as a cost (lower is better, consistent with other
+    matcher costs).
+
+    Args:
+        pred_kpts: ``(P, K, 3)`` predicted keypoints with ``(x, y, vis_logit)``
+            where x/y are normalised to ``[0, 1]``.
+        tgt_kpts: ``(T, K, 3)`` target keypoints with ``(x, y, v)`` where
+            v in {0, 1, 2}.  x/y normalised to ``[0, 1]``.
+        tgt_boxes: ``(T, 4)`` target boxes in ``cxcywh`` normalised format.
+            Used to compute per-instance scale ``s``.
+        sigmas: ``(K,)`` per-keypoint sigma values. Defaults to COCO sigmas.
+
+    Returns:
+        ``(P, T)`` cost matrix with values in ``[0, 1]``.
+    """
+    if sigmas is None:
+        sigmas = _COCO_KPT_SIGMAS.to(pred_kpts.device)  # (K,)
+
+    p = pred_kpts.shape[0]
+    t = tgt_kpts.shape[0]
+    k = pred_kpts.shape[1]
+
+    if p == 0 or t == 0:
+        return pred_kpts.new_zeros(p, t)
+
+    # Object scale: s^2 = bbox_area (wh product in normalised coords)
+    # tgt_boxes: (T, 4) cxcywh
+    s2 = (tgt_boxes[:, 2] * tgt_boxes[:, 3]).clamp(min=1e-6)  # (T,)
+
+    # pred_kpts: (P, K, 2) xy only
+    pred_xy = pred_kpts[:, :, :2]  # (P, K, 2)
+    tgt_xy = tgt_kpts[:, :, :2]  # (T, K, 2)
+    tgt_vis = tgt_kpts[:, :, 2]  # (T, K) visibility flags
+
+    # Squared Euclidean distance: (P, T, K)
+    # Expand to compute pairwise
+    pred_xy_exp = pred_xy.unsqueeze(1)  # (P, 1, K, 2)
+    tgt_xy_exp = tgt_xy.unsqueeze(0)  # (1, T, K, 2)
+    d2 = ((pred_xy_exp - tgt_xy_exp) ** 2).sum(-1)  # (P, T, K)
+
+    # OKS per keypoint: exp(-d^2 / (2 * s^2 * sigma^2))
+    # s2: (T,) -> (1, T, 1); sigmas: (K,) -> (1, 1, K)
+    var = 2.0 * s2.view(1, t, 1) * (sigmas.view(1, 1, k) ** 2)  # (1, T, K)
+    oks_per_kpt = torch.exp(-d2 / var)  # (P, T, K)
+
+    # Mask out unlabelled keypoints (v==0)
+    vis_mask = (tgt_vis > 0).float()  # (T, K)
+    vis_mask_exp = vis_mask.unsqueeze(0)  # (1, T, K)
+
+    oks_num = (oks_per_kpt * vis_mask_exp).sum(-1)  # (P, T)
+    oks_den = vis_mask_exp.sum(-1).clamp(min=1.0)  # (1, T)
+    oks = oks_num / oks_den  # (P, T)
+
+    return 1.0 - oks  # cost: lower = better match
 
 
 class HungarianMatcher(nn.Module):
@@ -50,6 +140,7 @@ class HungarianMatcher(nn.Module):
         mask_point_sample_ratio: int = 16,
         cost_mask_ce: float = 1,
         cost_mask_dice: float = 1,
+        cost_oks: float = 0.0,
     ):
         """Creates the matcher.
 
@@ -63,6 +154,9 @@ class HungarianMatcher(nn.Module):
             mask_point_sample_ratio: Downsampling ratio for mask point sampling.
             cost_mask_ce: Relative weight of the binary cross-entropy mask cost.
             cost_mask_dice: Relative weight of the Dice mask cost.
+            cost_oks: Relative weight of the OKS keypoint cost (pose estimation).
+                Set to 0 to disable; positive values add OKS to the cost matrix
+                when ``"keypoints"`` is present in targets.
         """
         super().__init__()
         self.cost_class = cost_class
@@ -73,6 +167,7 @@ class HungarianMatcher(nn.Module):
         self.mask_point_sample_ratio = mask_point_sample_ratio
         self.cost_mask_ce = cost_mask_ce
         self.cost_mask_dice = cost_mask_dice
+        self.cost_oks = cost_oks
         self._warned_non_finite_costs = False
 
     @staticmethod
@@ -207,10 +302,21 @@ class HungarianMatcher(nn.Module):
             # Dice loss cost (1 - dice coefficient)
             cost_mask_dice = batch_dice_loss(pred_masks_logits, tgt_masks_flat)
 
+        # OKS cost for pose estimation (only when keypoints are present in both
+        # targets AND predictions; encoder outputs don't have pred_keypoints)
+        kpts_present = "keypoints" in targets[0] and self.cost_oks > 0 and "pred_keypoints" in outputs
+        if kpts_present:
+            tgt_kpts = torch.cat([v["keypoints"] for v in targets])  # (sum_T, K, 3)
+            # pred_keypoints shape: (B, Q, K, 3)
+            pred_kpts = outputs["pred_keypoints"].flatten(0, 1)  # (B*Q, K, 3)
+            cost_oks_matrix = batch_oks_cost(pred_kpts, tgt_kpts, tgt_bbox)
+
         # Final cost matrix
         cost_matrix = self.cost_bbox * cost_bbox + self.cost_class * cost_class + self.cost_giou * cost_giou
         if masks_present:
             cost_matrix = cost_matrix + self.cost_mask_ce * cost_mask_ce + self.cost_mask_dice * cost_mask_dice
+        if kpts_present:
+            cost_matrix = cost_matrix + self.cost_oks * cost_oks_matrix
         cost_matrix = (
             cost_matrix.view(bs, num_queries, -1).float().cpu()
         )  # convert to float because bfloat16 doesn't play nicely with CPU
@@ -249,6 +355,7 @@ class HungarianMatcher(nn.Module):
 
 
 def build_matcher(args):
+    cost_oks = getattr(args, "set_cost_oks", 0.0)
     if args.segmentation_head:
         return HungarianMatcher(
             cost_class=args.set_cost_class,
@@ -258,6 +365,7 @@ def build_matcher(args):
             cost_mask_ce=args.mask_ce_loss_coef,
             cost_mask_dice=args.mask_dice_loss_coef,
             mask_point_sample_ratio=args.mask_point_sample_ratio,
+            cost_oks=cost_oks,
         )
     else:
         return HungarianMatcher(
@@ -265,4 +373,5 @@ def build_matcher(args):
             cost_bbox=args.set_cost_bbox,
             cost_giou=args.set_cost_giou,
             focal_alpha=args.focal_alpha,
+            cost_oks=cost_oks,
         )

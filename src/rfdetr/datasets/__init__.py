@@ -21,6 +21,7 @@ import torchvision
 from torch.utils.data import Dataset, Subset
 
 from rfdetr.datasets.coco import build_coco, build_roboflow_from_coco
+from rfdetr.datasets.coco_pose import CocoPoseDetection, build_coco_pose
 from rfdetr.datasets.o365 import build_o365
 from rfdetr.datasets.yolo import YoloDetection, build_roboflow_from_yolo
 
@@ -85,6 +86,8 @@ def build_roboflow(image_set: str, args: Any, resolution: int) -> Dataset[Any]:
 def build_dataset(image_set: str, args: Any, resolution: int) -> Dataset[Any]:
     if args.dataset_file == "coco":
         return build_coco(image_set, args, resolution)
+    if args.dataset_file == "coco_pose":
+        return build_coco_pose(image_set, args, resolution)
     if args.dataset_file == "o365":
         return build_o365(image_set, args, resolution)
     if args.dataset_file == "roboflow":

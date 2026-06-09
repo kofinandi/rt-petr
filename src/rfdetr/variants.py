@@ -27,17 +27,23 @@ __all__ = [
     "RFDETRSegLarge",
     "RFDETRSegXLarge",
     "RFDETRSeg2XLarge",
+    # Pose estimation variants
+    "RFDETRPoseSmall",
+    "RFDETRPoseMedium",
 ]
 
 from deprecate import deprecated_class
 
 from rfdetr.config import (
     ModelConfig,
+    PoseTrainConfig,
     RFDETRBaseConfig,
     RFDETRLargeConfig,
     RFDETRLargeDeprecatedConfig,
     RFDETRMediumConfig,
     RFDETRNanoConfig,
+    RFDETRPoseMediumConfig,
+    RFDETRPoseSmallConfig,
     RFDETRSeg2XLargeConfig,
     RFDETRSegLargeConfig,
     RFDETRSegMediumConfig,
@@ -222,3 +228,37 @@ class RFDETRSegXLarge(RFDETRSeg):
 class RFDETRSeg2XLarge(RFDETRSeg):
     size = "rfdetr-seg-2xlarge"
     _model_config_class = RFDETRSeg2XLargeConfig
+
+
+# ---------------------------------------------------------------------------
+# Pose estimation variants
+# ---------------------------------------------------------------------------
+
+
+class RFDETRPose(RFDETR):
+    """Base class for all RF-DETR pose estimation models.
+
+    Uses :class:`~rfdetr.config.PoseTrainConfig` by default so that
+    pose-specific loss coefficients and the ``coco_pose`` dataset file are
+    set automatically.
+    """
+
+    _train_config_class = PoseTrainConfig
+
+
+class RFDETRPoseSmall(RFDETRPose):
+    """RF-DETR Small backbone fine-tuned/trained for human pose estimation.
+
+    Predicts 17 COCO keypoints per person instance.  Designed for training
+    from scratch on COCO Keypoints 2017.
+    """
+
+    size = "rfdetr-pose-small"
+    _model_config_class = RFDETRPoseSmallConfig
+
+
+class RFDETRPoseMedium(RFDETRPose):
+    """RF-DETR Medium backbone trained for human pose estimation."""
+
+    size = "rfdetr-pose-medium"
+    _model_config_class = RFDETRPoseMediumConfig

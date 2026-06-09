@@ -1,0 +1,65 @@
+# RF-DETR Pose Small — COCO Keypoints training configuration.
+#
+# Trains a Small RF-DETR backbone from scratch on the COCO 2017 keypoints
+# dataset (17 person keypoints) using OKS-based matching and loss.
+#
+# Usage:
+#   rfdetr fit --config configs/rfdetr_pose_small.yaml
+#   rfdetr fit --config configs/rfdetr_pose_small.yaml \
+#     --model.train_config.init_args.dataset_dir /path/to/coco \
+#     --trainer.devices [7]
+#
+# Data layout expected:
+#   <dataset_dir>/
+#     train2017/                # JPEG images
+#     val2017/
+#     annotations/
+#       person_keypoints_train2017.json
+#       person_keypoints_val2017.json
+
+model:
+  model_config:
+    class_path: rfdetr.config.RFDETRPoseSmallConfig
+    init_args:
+      # Training from scratch: no pretrained weights loaded.
+      # To transfer from a detection checkpoint, set pretrain_weights to the
+      # path of the checkpoint (only backbone/transformer weights will load;
+      # the pose head is always randomly initialised).
+      pretrain_weights: null
+      num_classes: 1         # person only
+      num_keypoints: 17
+      pose_head: true
+  train_config:
+    class_path: rfdetr.config.PoseTrainConfig
+    init_args:
+      dataset_dir: /data/nkoefarago/data/coco
+      dataset_file: coco_pose
+      output_dir: output/rfdetr_pose_small
+      epochs: 150
+      batch_size: 8
+      grad_accum_steps: 2
+      lr: 1.0e-4
+      lr_encoder: 1.5e-4
+      lr_drop: 120
+      num_workers: 4
+      multi_scale: true
+      square_resize_div_64: true
+      use_ema: true
+      tensorboard: true
+      # Pose loss coefficients
+      keypoint_loss_coef: 5.0
+      oks_loss_coef: 2.0
+      vis_loss_coef: 1.0
+      # OKS matching cost weight
+      set_cost_oks: 2.0
+      cls_loss_coef: 2.0
+      ia_bce_loss: false
+
+trainer:
+  precision: bf16-mixed
+  # Use GPU 7 only
+  devices: [7]
+  accelerator: gpu
+  strategy: auto
+  gradient_clip_val: 0.1
+  log_every_n_steps: 50
