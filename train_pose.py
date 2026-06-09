@@ -44,6 +44,9 @@ def main():
     parser.add_argument("--devices", default="7", help="GPU device IDs (e.g. '7' or '0,1')")
     parser.add_argument("--no-multi-scale", action="store_true", help="Disable multi-scale training")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
+    parser.add_argument("--wandb", action="store_true", help="Enable Weights & Biases logging")
+    parser.add_argument("--project", default=None, help="W&B project name")
+    parser.add_argument("--run", default=None, help="W&B run name")
     args = parser.parse_args()
 
     # Set GPU visibility BEFORE importing torch/rfdetr so that torch.cuda.device_count()
@@ -74,6 +77,9 @@ def main():
         square_resize_div_64=True,
         use_ema=True,
         tensorboard=True,
+        wandb=args.wandb,
+        project=args.project,
+        run=args.run,
         keypoint_loss_coef=5.0,
         oks_loss_coef=2.0,
         vis_loss_coef=1.0,
