@@ -1,0 +1,44 @@
+# RF-DETR Pose Medium — COCO Keypoints training configuration.
+#
+# Medium backbone, 4 decoder layers, 576px resolution.
+# See rfdetr_pose_small.yaml for data layout.
+
+model:
+  model_config:
+    class_path: rfdetr.config.RFDETRPoseMediumConfig
+    init_args:
+      pretrain_weights: null
+      num_classes: 1
+      num_keypoints: 17
+      pose_head: true
+  train_config:
+    class_path: rfdetr.config.PoseTrainConfig
+    init_args:
+      dataset_dir: /data/nkoefarago/data/coco
+      dataset_file: coco_pose
+      output_dir: output/rfdetr_pose_medium
+      epochs: 150
+      batch_size: 6
+      grad_accum_steps: 2
+      lr: 1.0e-4
+      lr_encoder: 1.5e-4
+      lr_drop: 120
+      num_workers: 4
+      multi_scale: true
+      square_resize_div_64: true
+      use_ema: true
+      tensorboard: true
+      keypoint_loss_coef: 5.0
+      oks_loss_coef: 2.0
+      vis_loss_coef: 1.0
+      set_cost_oks: 2.0
+      cls_loss_coef: 2.0
+      ia_bce_loss: false
+
+trainer:
+  precision: bf16-mixed
+  devices: [7]
+  accelerator: gpu
+  strategy: auto
+  gradient_clip_val: 0.1
+  log_every_n_steps: 50

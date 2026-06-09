@@ -22,6 +22,30 @@ from rfdetr.models.math import accuracy
 from rfdetr.utilities import box_ops
 from rfdetr.utilities.distributed import get_world_size, is_dist_avail_and_initialized
 
+# COCO per-keypoint sigma values used for OKS loss
+_COCO_KPT_SIGMAS = torch.tensor(
+    [
+        0.026,
+        0.025,
+        0.025,
+        0.035,
+        0.035,
+        0.079,
+        0.079,
+        0.072,
+        0.072,
+        0.062,
+        0.062,
+        0.107,
+        0.107,
+        0.087,
+        0.087,
+        0.089,
+        0.089,
+    ],
+    dtype=torch.float32,
+)
+
 
 def sigmoid_focal_loss(inputs, targets, num_boxes, alpha: float = 0.25, gamma: float = 2):
     """
@@ -463,12 +487,87 @@ class SetCriterion(nn.Module):
         tgt_idx = torch.cat([tgt for (_, tgt) in indices])
         return batch_idx, tgt_idx
 
+    def loss_keypoints(self, outputs, targets, indices, num_boxes):
+        """Compute keypoint losses for pose estimation.
+
+        Applies three losses on matched prediction-target pairs:
+
+        - ``loss_kpt_l1``: L1 regression on the (x, y) coordinates of *visible*
+          keypoints (visibility > 0 in ground truth).
+        - ``loss_kpt_oks``: ``1 - OKS`` on matched pairs, using instance scale
+          derived from the predicted bounding box.
+        - ``loss_kpt_vis``: Binary cross-entropy on visibility logits, summed
+          over all keypoints (visible + invisible).
+
+        Args:
+            outputs: Model output dict (must contain ``"pred_keypoints"`` when
+                the pose head is active; otherwise returns zero losses).
+            targets: List of target dicts (must contain ``"keypoints"``).
+            indices: Matching indices from the Hungarian matcher.
+            num_boxes: Normalisation factor (number of target boxes).
+
+        Returns:
+            Dict with keys ``"loss_kpt_l1"``, ``"loss_kpt_oks"``,
+            ``"loss_kpt_vis"``.
+        """
+        # Encoder outputs (two-stage) don't have pred_keypoints — return zeros
+        if "pred_keypoints" not in outputs:
+            zero = outputs["pred_logits"].new_zeros(1).squeeze()
+            return {"loss_kpt_l1": zero, "loss_kpt_oks": zero, "loss_kpt_vis": zero}
+        idx = self._get_src_permutation_idx(indices)
+
+        pred_kpts = outputs["pred_keypoints"][idx]  # (M, K, 3)  x,y,vis_logit
+        target_kpts = torch.cat([t["keypoints"][j] for t, (_, j) in zip(targets, indices)], dim=0)  # (M, K, 3)
+
+        if pred_kpts.numel() == 0:
+            zero = pred_kpts.sum() * 0.0
+            return {"loss_kpt_l1": zero, "loss_kpt_oks": zero, "loss_kpt_vis": zero}
+
+        pred_xy = pred_kpts[..., :2]  # (M, K, 2)  in [0,1]
+        pred_vis_logit = pred_kpts[..., 2]  # (M, K)
+
+        tgt_xy = target_kpts[..., :2]  # (M, K, 2)  in [0,1]
+        tgt_vis = target_kpts[..., 2]  # (M, K)  0/1/2
+
+        # Visibility mask: keypoints with v > 0 are labelled (whether occluded or not)
+        vis_mask = (tgt_vis > 0).float()  # (M, K)
+
+        # --- L1 regression on (x, y) of visible keypoints ---
+        num_vis = vis_mask.sum().clamp(min=1.0)
+        l1_per_kpt = F.l1_loss(pred_xy, tgt_xy, reduction="none").sum(-1)  # (M, K)
+        loss_kpt_l1 = (l1_per_kpt * vis_mask).sum() / num_vis
+
+        # --- OKS loss ---
+        # Compute OKS using predicted bbox scale where available, else tgt bbox
+        src_boxes = outputs["pred_boxes"][idx]  # (M, 4) cxcywh
+        s2 = (src_boxes[:, 2] * src_boxes[:, 3]).detach().clamp(min=1e-6)  # (M,)
+        sigmas = _COCO_KPT_SIGMAS.to(pred_kpts.device)  # (K,)
+        var = 2.0 * s2.unsqueeze(-1) * (sigmas.unsqueeze(0) ** 2)  # (M, K)
+        d2 = ((pred_xy - tgt_xy) ** 2).sum(-1)  # (M, K)
+        oks_per_kpt = torch.exp(-d2 / var)  # (M, K)
+        oks_num = (oks_per_kpt * vis_mask).sum(-1)  # (M,)
+        oks_den = vis_mask.sum(-1).clamp(min=1.0)  # (M,)
+        oks = oks_num / oks_den  # (M,)
+        loss_kpt_oks = (1.0 - oks).sum() / num_boxes
+
+        # --- Visibility classification (BCE) ---
+        # Target: 1 if labelled (v >= 1), 0 if not labelled (v == 0)
+        vis_target = (tgt_vis > 0).float()
+        loss_kpt_vis = F.binary_cross_entropy_with_logits(pred_vis_logit, vis_target, reduction="sum") / num_boxes
+
+        return {
+            "loss_kpt_l1": loss_kpt_l1,
+            "loss_kpt_oks": loss_kpt_oks,
+            "loss_kpt_vis": loss_kpt_vis,
+        }
+
     def get_loss(self, loss, outputs, targets, indices, num_boxes, **kwargs):
         loss_map = {
             "labels": self.loss_labels,
             "cardinality": self.loss_cardinality,
             "boxes": self.loss_boxes,
             "masks": self.loss_masks,
+            "keypoints": self.loss_keypoints,
         }
         assert loss in loss_map, f"do you really want to compute {loss} loss?"
         return loss_map[loss](outputs, targets, indices, num_boxes, **kwargs)

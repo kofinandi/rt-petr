@@ -787,3 +787,94 @@ class SegmentationTrainConfig(TrainConfig):
     mask_dice_loss_coef: float = 5.0
     cls_loss_coef: float = 5.0
     segmentation_head: bool = True
+
+
+# ---------------------------------------------------------------------------
+# Pose estimation configs
+# ---------------------------------------------------------------------------
+
+
+class RFDETRPoseSmallConfig(ModelConfig):
+    """Configuration for RF-DETR Small trained for human pose estimation.
+
+    Identical to :class:`RFDETRSmallConfig` but with ``pose_head=True``,
+    ``num_keypoints=17`` (COCO), ``num_classes=1`` (person only), and
+    ``pretrain_weights=None`` (train from scratch).
+    """
+
+    encoder: EncoderName = "dinov2_windowed_small"
+    hidden_dim: int = 256
+    patch_size: int = 16
+    num_windows: int = 2
+    dec_layers: int = 3
+    sa_nheads: int = 8
+    ca_nheads: int = 16
+    dec_n_points: int = 2
+    num_queries: int = 300
+    num_select: int = 300
+    projector_scale: List[Literal["P3", "P4", "P5"]] = ["P4"]
+    out_feature_indexes: List[int] = [3, 6, 9, 12]
+    pretrain_weights: Optional[str] = None
+    resolution: int = 512
+    positional_encoding_size: int = 32
+    num_classes: int = 1
+    # --- Pose-specific fields ---
+    pose_head: bool = True
+    num_keypoints: int = 17
+
+
+class RFDETRPoseMediumConfig(ModelConfig):
+    """Configuration for RF-DETR Medium trained for human pose estimation."""
+
+    encoder: EncoderName = "dinov2_windowed_small"
+    hidden_dim: int = 256
+    patch_size: int = 16
+    num_windows: int = 2
+    dec_layers: int = 4
+    sa_nheads: int = 8
+    ca_nheads: int = 16
+    dec_n_points: int = 2
+    num_queries: int = 300
+    num_select: int = 300
+    projector_scale: List[Literal["P3", "P4", "P5"]] = ["P4"]
+    out_feature_indexes: List[int] = [3, 6, 9, 12]
+    pretrain_weights: Optional[str] = None
+    resolution: int = 576
+    positional_encoding_size: int = 36
+    num_classes: int = 1
+    pose_head: bool = True
+    num_keypoints: int = 17
+
+
+class PoseTrainConfig(TrainConfig):
+    """Training hyperparameters for human pose estimation.
+
+    Extends :class:`TrainConfig` with pose-specific loss coefficients and
+    defaults appropriate for COCO-Pose training.
+
+    Attributes:
+        dataset_file: Dataset type; set to ``"coco_pose"`` by default.
+        keypoint_loss_coef: Weight for the L1 keypoint regression loss.
+        oks_loss_coef: Weight for the OKS-based keypoint loss.
+        vis_loss_coef: Weight for keypoint visibility BCE loss.
+        set_cost_oks: OKS cost weight in the Hungarian matcher.
+        pose_head: Whether to train with the pose head (always True here).
+        num_keypoints: Number of predicted keypoints (17 for COCO).
+    """
+
+    # Extend the dataset_file type to include coco_pose
+    dataset_file: str = "coco_pose"  # type: ignore[assignment]
+    # Pose loss coefficients
+    keypoint_loss_coef: float = 5.0
+    oks_loss_coef: float = 2.0
+    vis_loss_coef: float = 1.0
+    # Matcher cost for OKS (added to bbox + class cost)
+    set_cost_oks: float = 2.0
+    # Echo architecture flags for convenience (ModelConfig is authoritative)
+    pose_head: bool = True
+    num_keypoints: int = 17
+    # Sensible defaults for COCO-pose training
+    square_resize_div_64: bool = True
+    multi_scale: bool = True
+    cls_loss_coef: float = 2.0
+    ia_bce_loss: bool = False
