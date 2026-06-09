@@ -46,8 +46,12 @@ def main():
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     args = parser.parse_args()
 
-    # Set GPU visibility
+    # Set GPU visibility BEFORE importing torch/rfdetr so that torch.cuda.device_count()
+    # reflects only the requested GPU(s). When CUDA_VISIBLE_DEVICES=7, PyTorch sees
+    # it as "cuda:0" internally but only the physical GPU 7 is used.
     os.environ["CUDA_VISIBLE_DEVICES"] = args.devices
+    # Lightning devices=1 means "use 1 GPU" after CUDA_VISIBLE_DEVICES is applied
+    num_devices = len(args.devices.split(",")) if args.devices != "-1" else 1
 
     from rfdetr.config import PoseTrainConfig, RFDETRPoseMediumConfig, RFDETRPoseSmallConfig
 
@@ -76,7 +80,7 @@ def main():
         set_cost_oks=2.0,
         cls_loss_coef=2.0,
         ia_bce_loss=False,
-        devices=1,
+        devices=num_devices,
         accelerator="gpu",
         seed=args.seed,
         resume=args.resume,
@@ -90,8 +94,34 @@ def main():
     print(f"[Train] Model: RF-DETR Pose {args.model.capitalize()}")
     print(f"[Train] COCO data: {args.coco_path}")
     print(f"[Train] Output: {args.output_dir}")
-    print(f"[Train] Epochs: {args.epochs}, Batch: {args.batch_size}x{args.grad_accum}={args.batch_size * args.grad_accum} eff.")
-    print(f"[Train] Device(s): CUDA_VISIBLE_DEVICES={args.devices}")
+    print(
+        f"[Train] Epochs: {args.epochs}, "
+        f"Batch: {args.batch_size}x{args.grad_accum}={args.batch_size * args.grad_accum} eff."
+    )
+    print(f"[Train] Device(s): CUDA_VISIBLE_DEVICES={args.devices} (Lightning sees {num_devices} GPU(s))")
+    print()
+
+    # Verify COCO data paths exist before starting
+    import torch
+    from pathlib import Path
+
+    coco_root = Path(args.coco_path)
+    required_paths = [
+        coco_root / "train2017",
+        coco_root / "val2017",
+        coco_root / "annotations" / "person_keypoints_train2017.json",
+        coco_root / "annotations" / "person_keypoints_val2017.json",
+    ]
+    missing = [str(p) for p in required_paths if not p.exists()]
+    if missing:
+        raise FileNotFoundError(
+            f"Missing COCO paths:\n" + "\n".join(f"  {p}" for p in missing)
+        )
+
+    print(f"[Train] CUDA available: {torch.cuda.is_available()}, devices: {torch.cuda.device_count()}")
+    if torch.cuda.is_available():
+        for i in range(torch.cuda.device_count()):
+            print(f"[Train]   cuda:{i} → {torch.cuda.get_device_name(i)}")
     print()
 
     model_module = RFDETRModelModule(model_config, train_config)
