@@ -136,6 +136,8 @@ def _filter_intentional_keys(keys: list[str]) -> list[str]:
         *_QUERY_PARAM_SUFFIXES,
         "enc_out_class_embed.",
         "enc_out_bbox_embed.",
+        # Pose head — always randomly initialised (no pretrained detection weights exist).
+        "pose_head.",
     )
 
     def _is_intentional(key: str) -> bool:

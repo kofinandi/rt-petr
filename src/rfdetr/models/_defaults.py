@@ -52,8 +52,11 @@ class ModelDefaults:
         set_cost_class: Classification cost weight for the matcher.
         set_cost_bbox: L1 bbox cost weight for the matcher.
         set_cost_giou: GIoU cost weight for the matcher.
+        set_cost_oks: OKS cost weight for the pose matcher.
         bbox_loss_coef: Bbox regression loss coefficient.
         giou_loss_coef: GIoU loss coefficient.
+        oks_loss_coef: OKS keypoint loss coefficient.
+        kpt_vis_loss_coef: Keypoint visibility BCE loss coefficient.
         sum_group_losses: Whether to sum (vs. average) group-DETR losses.
         use_varifocal_loss: Whether to use varifocal loss instead of focal loss.
         use_position_supervised_loss: Whether to use position-supervised loss.
@@ -94,8 +97,11 @@ class ModelDefaults:
     set_cost_class: float = 2.0
     set_cost_bbox: float = 5.0
     set_cost_giou: float = 2.0
+    set_cost_oks: float = 4.0
     bbox_loss_coef: float = 5.0
     giou_loss_coef: float = 2.0
+    oks_loss_coef: float = 5.0
+    kpt_vis_loss_coef: float = 1.0
     sum_group_losses: bool = False
     use_varifocal_loss: bool = False
     use_position_supervised_loss: bool = False

@@ -27,6 +27,7 @@ from rfdetr.config import ModelConfig, TrainConfig
 from rfdetr.training.callbacks import (
     BestModelCallback,
     DropPathCallback,
+    PoseEvalCallback,
     RFDETREarlyStopping,
     RFDETREMACallback,
 )
@@ -163,16 +164,17 @@ def build_trainer(
             "%s → spawn-based DDP to avoid OpenMP thread pool corruption after fork.",
             tc.strategy,
         )
-    elif strategy == "ddp" and model_config.segmentation_head:
-        # The segmentation head's sparse_forward() returns dict intermediates and
-        # leaves some parameters unused on certain forward steps, causing DDP to
-        # raise "It looks like your LightningModule has parameters that were not
-        # used in producing the loss" with plain ddp.  Enabling
+    elif strategy == "ddp" and (model_config.segmentation_head or getattr(model_config, "pose_head", False)):
+        # The segmentation head's sparse_forward() and the pose head both leave
+        # some parameters unused on certain forward steps (e.g., batches that
+        # contain no valid keypoint targets), causing DDP to raise
+        # "parameters were not used in producing the loss".  Enabling
         # find_unused_parameters lets DDP traverse the autograd graph after each
         # backward pass to detect which parameters contributed to the loss.
         strategy = _DDPStrategy(find_unused_parameters=True)
         _logger.info(
-            "segmentation_head=True with strategy='ddp' → DDPStrategy(find_unused_parameters=True).",
+            "%s_head=True with strategy='ddp' → DDPStrategy(find_unused_parameters=True).",
+            "segmentation" if model_config.segmentation_head else "pose",
         )
     sharded = any(s in str(strategy).lower() for s in ("fsdp", "deepspeed"))
     enable_ema = bool(tc.use_ema) and not sharded
@@ -205,15 +207,24 @@ def build_trainer(
     if tc.drop_path > 0.0:
         callbacks.append(DropPathCallback(drop_path=tc.drop_path))
 
-    # COCO mAP + F1 evaluation.
-    callbacks.append(
-        COCOEvalCallback(
-            max_dets=tc.eval_max_dets,
-            segmentation=model_config.segmentation_head,
-            eval_interval=tc.eval_interval,
-            log_per_class_metrics=tc.log_per_class_metrics,
+    # COCO mAP evaluation — skip for pose (PoseEvalCallback handles kpt AP instead).
+    _pose_head = getattr(model_config, "pose_head", False)
+    if not _pose_head:
+        callbacks.append(
+            COCOEvalCallback(
+                max_dets=tc.eval_max_dets,
+                segmentation=model_config.segmentation_head,
+                eval_interval=tc.eval_interval,
+                log_per_class_metrics=tc.log_per_class_metrics,
+            )
         )
-    )
+    else:
+        callbacks.append(
+            PoseEvalCallback(
+                eval_interval=tc.eval_interval,
+                num_keypoints=getattr(model_config, "num_keypoints", 17),
+            )
+        )
 
     # Latest resume checkpoint — overwritten every epoch.
     # Skip when checkpoint_interval == 1 to avoid duplicate ModelCheckpoint state_key.
@@ -244,10 +255,14 @@ def build_trainer(
     )
 
     # Best-model checkpointing — monitor EMA metric only when EMA is active.
+    # For pose estimation, monitor keypoint AP instead of box mAP.
+    _monitor_regular = "val/kpt_mAP" if _pose_head else "val/mAP_50_95"
+    _monitor_ema = None if _pose_head else ("val/ema_mAP_50_95" if enable_ema else None)
     callbacks.append(
         BestModelCallback(
             output_dir=tc.output_dir,
-            monitor_ema="val/ema_mAP_50_95" if enable_ema else None,
+            monitor_regular=_monitor_regular,
+            monitor_ema=_monitor_ema,
             run_test=tc.run_test,
             skip_best_epochs=tc.skip_best_epochs,
         )

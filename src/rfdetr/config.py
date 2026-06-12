@@ -119,6 +119,8 @@ class ModelConfig(BaseConfig):
     cls_loss_coef: float = 1.0
     segmentation_head: bool = False
     mask_downsample_ratio: int = 4
+    pose_head: bool = False
+    num_keypoints: int = 17
     backbone_lora: bool = False
     freeze_encoder: bool = False
     license: str = "Apache-2.0"
@@ -448,6 +450,21 @@ class RFDETRSmallConfig(RFDETRBaseConfig):
     pretrain_weights: Optional[str] = "rf-detr-small.pth"
 
 
+class RFDETRSmallPoseConfig(RFDETRSmallConfig):
+    """Configuration for RF-DETR Small used for COCO human pose estimation.
+
+    Trains from scratch with DINOv2 backbone; no pretrained detection weights.
+    Single class (person), 17-keypoint COCO pose head.
+    """
+
+    pose_head: bool = True
+    num_keypoints: int = 17
+    num_classes: int = 1
+    num_queries: int = 300
+    num_select: int = 300
+    pretrain_weights: Optional[str] = None
+
+
 class RFDETRMediumConfig(RFDETRBaseConfig):
     """The configuration for an RF-DETR Medium model."""
 
@@ -619,7 +636,7 @@ class TrainConfig(BaseModel):
     ia_bce_loss: bool = True
     cls_loss_coef: float = 1.0
     num_select: int = 300
-    dataset_file: Literal["coco", "o365", "roboflow", "yolo"] = "roboflow"
+    dataset_file: Literal["coco", "coco_pose", "o365", "roboflow", "yolo"] = "roboflow"
     square_resize_div_64: bool = True
     dataset_dir: str
     output_dir: str = "output"
@@ -787,3 +804,32 @@ class SegmentationTrainConfig(TrainConfig):
     mask_dice_loss_coef: float = 5.0
     cls_loss_coef: float = 5.0
     segmentation_head: bool = True
+
+
+class PoseTrainConfig(TrainConfig):
+    """Training configuration for RF-DETR pose estimation.
+
+    Uses the COCO-pose dataset and enables the pose head.  Loss coefficients and
+    matcher costs are tuned for OKS-based keypoint supervision.
+    """
+
+    dataset_file: Literal["coco_pose"] = "coco_pose"  # type: ignore[assignment]
+    pose_head: bool = True
+    # Loss coefficients for pose (keypoint OKS + visibility BCE).
+    oks_loss_coef: float = 5.0
+    kpt_vis_loss_coef: float = 1.0
+    # Matching costs for pose.
+    set_cost_oks: float = 4.0
+    # Keep box losses for training stability.
+    bbox_loss_coef: float = 2.0
+    giou_loss_coef: float = 1.0
+    set_cost_bbox: float = 2.0
+    set_cost_giou: float = 0.0  # disabled: OKS replaces GIoU cost
+    cls_loss_coef: float = 2.0
+    # Multi-scale and other pose-specific settings.
+    multi_scale: bool = True
+    augmentation_backend: Literal["cpu"] = "cpu"  # type: ignore[assignment]
+    lr: float = 1e-4
+    lr_scheduler: Literal["step", "cosine"] = "cosine"
+    lr_min_factor: float = 0.01
+    warmup_epochs: float = 1.0

@@ -25,6 +25,7 @@ from torch import nn
 
 from rfdetr.models.heads.segmentation import point_sample
 from rfdetr.utilities.box_ops import batch_dice_loss, batch_sigmoid_ce_loss, box_cxcywh_to_xyxy, generalized_box_iou
+from rfdetr.utilities.keypoint_ops import get_coco_sigmas, pairwise_oks
 from rfdetr.utilities.logger import get_logger
 
 logger = get_logger()
@@ -50,6 +51,8 @@ class HungarianMatcher(nn.Module):
         mask_point_sample_ratio: int = 16,
         cost_mask_ce: float = 1,
         cost_mask_dice: float = 1,
+        cost_oks: float = 0.0,
+        num_keypoints: int = 17,
     ):
         """Creates the matcher.
 
@@ -63,12 +66,18 @@ class HungarianMatcher(nn.Module):
             mask_point_sample_ratio: Downsampling ratio for mask point sampling.
             cost_mask_ce: Relative weight of the binary cross-entropy mask cost.
             cost_mask_dice: Relative weight of the Dice mask cost.
+            cost_oks: Relative weight of the OKS cost for pose estimation.
+            num_keypoints: Number of keypoints for OKS computation.
         """
         super().__init__()
         self.cost_class = cost_class
         self.cost_bbox = cost_bbox
         self.cost_giou = cost_giou
-        assert cost_class != 0 or cost_bbox != 0 or cost_giou != 0, "all costs can't be 0"
+        self.cost_oks = cost_oks
+        self.num_keypoints = num_keypoints
+        assert (
+            cost_class != 0 or cost_bbox != 0 or cost_giou != 0 or cost_oks != 0
+        ), "all costs can't be 0"
         self.focal_alpha = focal_alpha
         self.mask_point_sample_ratio = mask_point_sample_ratio
         self.cost_mask_ce = cost_mask_ce
@@ -207,10 +216,24 @@ class HungarianMatcher(nn.Module):
             # Dice loss cost (1 - dice coefficient)
             cost_mask_dice = batch_dice_loss(pred_masks_logits, tgt_masks_flat)
 
+        # OKS cost for pose estimation
+        kpts_present = "pred_keypoints" in outputs and "keypoints" in targets[0]
+        if kpts_present and self.cost_oks > 0:
+            # pred_keypoints: [B, Q, K, 2] (normalised) → flatten to [B*Q, K, 2]
+            out_kpts = outputs["pred_keypoints"].flatten(0, 1)  # [B*Q, K, 2]
+            tgt_kpts = torch.cat([v["keypoints"][..., :2] for v in targets])  # [sum_T, K, 2]
+            tgt_kpts_vis = torch.cat([v["keypoints"][..., 2] for v in targets])  # [sum_T, K]
+            tgt_areas = torch.cat([v["area"] for v in targets])  # [sum_T]
+            sigmas = get_coco_sigmas(device=out_kpts.device)
+            # [B*Q, sum_T] pairwise OKS
+            cost_oks = -pairwise_oks(out_kpts, tgt_kpts, tgt_kpts_vis, tgt_areas, sigmas)
+
         # Final cost matrix
         cost_matrix = self.cost_bbox * cost_bbox + self.cost_class * cost_class + self.cost_giou * cost_giou
         if masks_present:
             cost_matrix = cost_matrix + self.cost_mask_ce * cost_mask_ce + self.cost_mask_dice * cost_mask_dice
+        if kpts_present and self.cost_oks > 0:
+            cost_matrix = cost_matrix + self.cost_oks * cost_oks
         cost_matrix = (
             cost_matrix.view(bs, num_queries, -1).float().cpu()
         )  # convert to float because bfloat16 doesn't play nicely with CPU
@@ -249,6 +272,9 @@ class HungarianMatcher(nn.Module):
 
 
 def build_matcher(args):
+    _pose_head = getattr(args, "pose_head", False)
+    _cost_oks = getattr(args, "set_cost_oks", 0.0)
+    _num_keypoints = getattr(args, "num_keypoints", 17)
     if args.segmentation_head:
         return HungarianMatcher(
             cost_class=args.set_cost_class,
@@ -258,6 +284,8 @@ def build_matcher(args):
             cost_mask_ce=args.mask_ce_loss_coef,
             cost_mask_dice=args.mask_dice_loss_coef,
             mask_point_sample_ratio=args.mask_point_sample_ratio,
+            cost_oks=_cost_oks if _pose_head else 0.0,
+            num_keypoints=_num_keypoints,
         )
     else:
         return HungarianMatcher(
@@ -265,4 +293,6 @@ def build_matcher(args):
             cost_bbox=args.set_cost_bbox,
             cost_giou=args.set_cost_giou,
             focal_alpha=args.focal_alpha,
+            cost_oks=_cost_oks if _pose_head else 0.0,
+            num_keypoints=_num_keypoints,
         )

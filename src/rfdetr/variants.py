@@ -16,6 +16,7 @@ __all__ = [
     "RFDETRBase",
     "RFDETRNano",
     "RFDETRSmall",
+    "RFDETRSmallPose",
     "RFDETRMedium",
     "RFDETRLarge",
     "RFDETRLargeDeprecated",
@@ -33,6 +34,7 @@ from deprecate import deprecated_class
 
 from rfdetr.config import (
     ModelConfig,
+    PoseTrainConfig,
     RFDETRBaseConfig,
     RFDETRLargeConfig,
     RFDETRLargeDeprecatedConfig,
@@ -46,6 +48,7 @@ from rfdetr.config import (
     RFDETRSegSmallConfig,
     RFDETRSegXLargeConfig,
     RFDETRSmallConfig,
+    RFDETRSmallPoseConfig,
     SegmentationTrainConfig,
 )
 from rfdetr.detr import RFDETR
@@ -78,6 +81,19 @@ class RFDETRSmall(RFDETR):
 
     size = "rfdetr-small"
     _model_config_class = RFDETRSmallConfig
+
+
+class RFDETRSmallPose(RFDETR):
+    """RF-DETR Small configured for COCO human pose estimation.
+
+    Trains from scratch (DINOv2 backbone kept, decoder + pose head randomly
+    initialised).  Uses the COCO ``person_keypoints_*`` annotations and an
+    OKS-based Hungarian matcher.
+    """
+
+    size = "rfdetr-small-pose"
+    _model_config_class = RFDETRSmallPoseConfig
+    _train_config_class = PoseTrainConfig
 
 
 class RFDETRMedium(RFDETR):

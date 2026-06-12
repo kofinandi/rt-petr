@@ -21,6 +21,7 @@ from rfdetr.models.heads.segmentation import (
 from rfdetr.models.math import accuracy
 from rfdetr.utilities import box_ops
 from rfdetr.utilities.distributed import get_world_size, is_dist_avail_and_initialized
+from rfdetr.utilities.keypoint_ops import compute_oks, get_coco_sigmas
 
 
 def sigmoid_focal_loss(inputs, targets, num_boxes, alpha: float = 0.25, gamma: float = 2):
@@ -146,6 +147,8 @@ class SetCriterion(nn.Module):
         use_position_supervised_loss=False,
         ia_bce_loss=False,
         mask_point_sample_ratio: int = 16,
+        pose_head: bool = False,
+        num_keypoints: int = 17,
     ):
         """Create the criterion.
 
@@ -169,6 +172,8 @@ class SetCriterion(nn.Module):
         self.use_position_supervised_loss = use_position_supervised_loss
         self.ia_bce_loss = ia_bce_loss
         self.mask_point_sample_ratio = mask_point_sample_ratio
+        self.pose_head = pose_head
+        self.num_keypoints = num_keypoints
 
     def loss_labels(self, outputs, targets, indices, num_boxes, log=True):
         """Classification loss (Binary focal loss) targets dicts must contain the key "labels" containing a tensor of
@@ -185,13 +190,22 @@ class SetCriterion(nn.Module):
             src_boxes = outputs["pred_boxes"][idx]
             target_boxes = torch.cat([t["boxes"][i] for t, (_, i) in zip(targets, indices)], dim=0)
 
-            iou_targets = torch.diag(
-                box_ops.box_iou(
-                    box_ops.box_cxcywh_to_xyxy(src_boxes.detach()),
-                    box_ops.box_cxcywh_to_xyxy(target_boxes),
-                )[0]
-            )
-            pos_ious = iou_targets.clone().detach()
+            if self.pose_head and "pred_keypoints" in outputs and "keypoints" in targets[0]:
+                # Use OKS as the quality target for IA-BCE when pose head is active.
+                src_kpts = outputs["pred_keypoints"][idx]  # [N, K, 2]
+                tgt_kpts = torch.cat([t["keypoints"][i, :, :2] for t, (_, i) in zip(targets, indices)], dim=0)
+                tgt_vis = torch.cat([t["keypoints"][i, :, 2] for t, (_, i) in zip(targets, indices)], dim=0)
+                tgt_areas = torch.cat([t["area"][i] for t, (_, i) in zip(targets, indices)], dim=0)
+                sigmas = get_coco_sigmas(device=src_kpts.device)
+                pos_ious = compute_oks(src_kpts.detach(), tgt_kpts, tgt_vis, tgt_areas, sigmas)
+            else:
+                iou_targets = torch.diag(
+                    box_ops.box_iou(
+                        box_ops.box_cxcywh_to_xyxy(src_boxes.detach()),
+                        box_ops.box_cxcywh_to_xyxy(target_boxes),
+                    )[0]
+                )
+                pos_ious = iou_targets.clone().detach()
             prob = src_logits.sigmoid()
             # init positive weights and negative weights
             pos_weights = torch.zeros_like(src_logits)
@@ -214,13 +228,21 @@ class SetCriterion(nn.Module):
             src_boxes = outputs["pred_boxes"][idx]
             target_boxes = torch.cat([t["boxes"][i] for t, (_, i) in zip(targets, indices)], dim=0)
 
-            iou_targets = torch.diag(
-                box_ops.box_iou(
-                    box_ops.box_cxcywh_to_xyxy(src_boxes.detach()),
-                    box_ops.box_cxcywh_to_xyxy(target_boxes),
-                )[0]
-            )
-            pos_ious = iou_targets.clone().detach()
+            if self.pose_head and "pred_keypoints" in outputs and "keypoints" in targets[0]:
+                src_kpts = outputs["pred_keypoints"][idx]
+                tgt_kpts = torch.cat([t["keypoints"][i, :, :2] for t, (_, i) in zip(targets, indices)], dim=0)
+                tgt_vis = torch.cat([t["keypoints"][i, :, 2] for t, (_, i) in zip(targets, indices)], dim=0)
+                tgt_areas = torch.cat([t["area"][i] for t, (_, i) in zip(targets, indices)], dim=0)
+                sigmas = get_coco_sigmas(device=src_kpts.device)
+                pos_ious = compute_oks(src_kpts.detach(), tgt_kpts, tgt_vis, tgt_areas, sigmas)
+            else:
+                iou_targets = torch.diag(
+                    box_ops.box_iou(
+                        box_ops.box_cxcywh_to_xyxy(src_boxes.detach()),
+                        box_ops.box_cxcywh_to_xyxy(target_boxes),
+                    )[0]
+                )
+                pos_ious = iou_targets.clone().detach()
             # pos_ious_func = pos_ious ** 2
             pos_ious_func = pos_ious
 
@@ -252,13 +274,21 @@ class SetCriterion(nn.Module):
             src_boxes = outputs["pred_boxes"][idx]
             target_boxes = torch.cat([t["boxes"][i] for t, (_, i) in zip(targets, indices)], dim=0)
 
-            iou_targets = torch.diag(
-                box_ops.box_iou(
-                    box_ops.box_cxcywh_to_xyxy(src_boxes.detach()),
-                    box_ops.box_cxcywh_to_xyxy(target_boxes),
-                )[0]
-            )
-            pos_ious = iou_targets.clone().detach()
+            if self.pose_head and "pred_keypoints" in outputs and "keypoints" in targets[0]:
+                src_kpts = outputs["pred_keypoints"][idx]
+                tgt_kpts = torch.cat([t["keypoints"][i, :, :2] for t, (_, i) in zip(targets, indices)], dim=0)
+                tgt_vis = torch.cat([t["keypoints"][i, :, 2] for t, (_, i) in zip(targets, indices)], dim=0)
+                tgt_areas = torch.cat([t["area"][i] for t, (_, i) in zip(targets, indices)], dim=0)
+                sigmas = get_coco_sigmas(device=src_kpts.device)
+                pos_ious = compute_oks(src_kpts.detach(), tgt_kpts, tgt_vis, tgt_areas, sigmas)
+            else:
+                iou_targets = torch.diag(
+                    box_ops.box_iou(
+                        box_ops.box_cxcywh_to_xyxy(src_boxes.detach()),
+                        box_ops.box_cxcywh_to_xyxy(target_boxes),
+                    )[0]
+                )
+                pos_ious = iou_targets.clone().detach()
 
             cls_iou_targets = torch.zeros(
                 (src_logits.shape[0], src_logits.shape[1], self.num_classes),
@@ -451,6 +481,55 @@ class SetCriterion(nn.Module):
         del target_masks
         return losses
 
+    def loss_keypoints(self, outputs, targets, indices, num_boxes):
+        """Compute OKS keypoint loss and BCE visibility loss on matched pairs.
+
+        Expects ``outputs["pred_keypoints"]`` of shape ``[B, Q, K, 2]`` (normalised
+        ``[0, 1]``) and ``outputs["pred_kpt_vis"]`` of shape ``[B, Q, K]``.
+        Targets must contain ``"keypoints"`` tensors of shape ``[N, K, 3]`` where
+        the last dimension is ``(x, y, visibility)``, and ``"area"`` tensors of
+        shape ``[N]`` (normalised to ``[0, 1]^2``).
+
+        Args:
+            outputs: Model outputs dict.
+            targets: List of per-image target dicts.
+            indices: Hungarian matching indices.
+            num_boxes: Normalisation denominator (number of matched pairs × groups).
+
+        Returns:
+            Dict with keys ``"loss_keypoints"`` (OKS loss) and ``"loss_kpt_vis"``
+            (visibility BCE loss).
+        """
+        if "pred_keypoints" not in outputs:
+            device = next(iter(outputs.values())).device
+            return {"loss_keypoints": torch.zeros(1, device=device)[0], "loss_kpt_vis": torch.zeros(1, device=device)[0]}
+
+        idx = self._get_src_permutation_idx(indices)
+        src_kpts = outputs["pred_keypoints"][idx]  # [N, K, 2]
+        src_vis_logits = outputs["pred_kpt_vis"][idx]  # [N, K]
+
+        tgt_kpts_xy = torch.cat([t["keypoints"][j, :, :2] for t, (_, j) in zip(targets, indices)], dim=0)  # [N, K, 2]
+        tgt_vis = torch.cat([t["keypoints"][j, :, 2] for t, (_, j) in zip(targets, indices)], dim=0)  # [N, K]
+        tgt_areas = torch.cat([t["area"][j] for t, (_, j) in zip(targets, indices)], dim=0)  # [N]
+
+        if src_kpts.numel() == 0:
+            return {
+                "loss_keypoints": src_kpts.sum(),
+                "loss_kpt_vis": src_vis_logits.sum(),
+            }
+
+        sigmas = get_coco_sigmas(device=src_kpts.device)
+        oks = compute_oks(src_kpts, tgt_kpts_xy, tgt_vis, tgt_areas, sigmas)
+        loss_kpts = (1.0 - oks).sum() / num_boxes
+
+        # Visibility BCE: target is binary (v > 0 → 1, else 0).
+        # Only count keypoints that have annotation (v >= 0 always; all COCO kpts are annotated).
+        vis_target = (tgt_vis > 0).float()  # [N, K]
+        loss_vis = F.binary_cross_entropy_with_logits(src_vis_logits, vis_target, reduction="none")
+        loss_vis = loss_vis.sum() / (num_boxes * self.num_keypoints)
+
+        return {"loss_keypoints": loss_kpts, "loss_kpt_vis": loss_vis}
+
     def _get_src_permutation_idx(self, indices):
         # permute predictions following indices
         batch_idx = torch.cat([torch.full_like(src, i) for i, (src, _) in enumerate(indices)])
@@ -469,6 +548,7 @@ class SetCriterion(nn.Module):
             "cardinality": self.loss_cardinality,
             "boxes": self.loss_boxes,
             "masks": self.loss_masks,
+            "keypoints": self.loss_keypoints,
         }
         assert loss in loss_map, f"do you really want to compute {loss} loss?"
         return loss_map[loss](outputs, targets, indices, num_boxes, **kwargs)

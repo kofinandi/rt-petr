@@ -37,11 +37,13 @@ _MC_NAMESPACE_FIELDS = {
     "mask_downsample_ratio",
     "num_channels",
     "num_classes",
+    "num_keypoints",
     "num_queries",
     "num_select",
     "num_windows",
     "out_feature_indexes",
     "patch_size",
+    "pose_head",
     "positional_encoding_size",
     "pretrain_weights",
     "projector_scale",
@@ -95,6 +97,18 @@ _TC_NON_NAMESPACE_FIELDS = {
     "lr_min_factor",
     # Dataset class labels.
     "class_names",
+    # Pose extras — handled via explicit getattr() in the namespace builder.
+    "oks_loss_coef",
+    "kpt_vis_loss_coef",
+    "set_cost_oks",
+    # bbox/giou costs are also overridden explicitly above; exclude from bulk dump
+    # to avoid double-inclusion when PoseTrainConfig overrides them.
+    "bbox_loss_coef",
+    "giou_loss_coef",
+    "set_cost_bbox",
+    "set_cost_giou",
+    # pose_head is an MC field (wins); exclude TC copy.
+    "pose_head",
 }
 
 # Derived: all TrainConfig fields not in _TC_NON_NAMESPACE_FIELDS.
@@ -140,7 +154,7 @@ def _namespace_from_configs(
 
     return types.SimpleNamespace(
         **{
-            # Architectural defaults — 35 constants not exposed in ModelConfig/TrainConfig.
+            # Architectural defaults — constants not exposed in ModelConfig/TrainConfig.
             **dataclasses.asdict(d),
             # TrainConfig: fields consumed by legacy builders (PTL, logger, auto-batch
             # fields excluded; see _TC_NAMESPACE_FIELDS).  Architecture copies
@@ -153,6 +167,16 @@ def _namespace_from_configs(
             "mask_ce_loss_coef": getattr(tc, "mask_ce_loss_coef", 5.0),
             "mask_dice_loss_coef": getattr(tc, "mask_dice_loss_coef", 5.0),
             "mask_point_sample_ratio": getattr(tc, "mask_point_sample_ratio", 16),
+            # Pose extras (PoseTrainConfig only — absent from base TrainConfig).
+            # TrainConfig values override ModelDefaults when present on the train config.
+            "oks_loss_coef": getattr(tc, "oks_loss_coef", d.oks_loss_coef),
+            "kpt_vis_loss_coef": getattr(tc, "kpt_vis_loss_coef", d.kpt_vis_loss_coef),
+            "set_cost_oks": getattr(tc, "set_cost_oks", d.set_cost_oks),
+            # Allow PoseTrainConfig to override bbox/giou matching costs too.
+            "set_cost_bbox": getattr(tc, "set_cost_bbox", d.set_cost_bbox),
+            "set_cost_giou": getattr(tc, "set_cost_giou", d.set_cost_giou),
+            "bbox_loss_coef": getattr(tc, "bbox_loss_coef", d.bbox_loss_coef),
+            "giou_loss_coef": getattr(tc, "giou_loss_coef", d.giou_loss_coef),
             # Transformations: fields requiring a default sentinel or transitional priority.
             "cls_loss_coef": cls_loss_coef,
             "resume": tc.resume or "",

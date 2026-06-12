@@ -26,6 +26,13 @@ import torchvision
 from PIL import Image
 from torchvision.transforms.v2 import Compose, ToDtype, ToImage
 
+try:
+    import cv2 as _cv2
+
+    _cv2.setNumThreads(1)
+except ImportError:
+    pass
+
 from rfdetr.datasets.aug_config import AUG_CONFIG
 from rfdetr.datasets.transforms import AlbumentationsWrapper, Normalize
 from rfdetr.utilities.logger import get_logger
@@ -165,10 +172,14 @@ class CocoDetection(torchvision.datasets.CocoDetection):
         transforms: Optional[Any],
         include_masks: bool = False,
         remap_category_ids: bool = False,
+        include_keypoints: bool = False,
+        num_keypoints: int = 17,
     ) -> None:
         super(CocoDetection, self).__init__(img_folder, ann_file)
         self._transforms = transforms
         self.include_masks = include_masks
+        self.include_keypoints = include_keypoints
+        self.num_keypoints = num_keypoints
         if remap_category_ids:
             # Mapping from original COCO category_id to contiguous label indices
             self.cat2label = {cat_id: i for i, cat_id in enumerate(sorted(self.coco.cats.keys()))}
@@ -179,7 +190,12 @@ class CocoDetection(torchvision.datasets.CocoDetection):
         else:
             self.cat2label = None
             self.label2cat = None
-        self.prepare = ConvertCoco(include_masks=include_masks, cat2label=self.cat2label)
+        self.prepare = ConvertCoco(
+            include_masks=include_masks,
+            cat2label=self.cat2label,
+            include_keypoints=include_keypoints,
+            num_keypoints=num_keypoints,
+        )
 
     def __getitem__(self, idx: int) -> Tuple[Any, Any]:
         img, target = super(CocoDetection, self).__getitem__(idx)
@@ -219,9 +235,17 @@ class ConvertCoco(object):
             COCO-style datasets (e.g. IDs 1–90 with gaps) so that labels stay within the model's output range.
     """
 
-    def __init__(self, include_masks: bool = False, cat2label: Optional[Dict[int, int]] = None) -> None:
+    def __init__(
+        self,
+        include_masks: bool = False,
+        cat2label: Optional[Dict[int, int]] = None,
+        include_keypoints: bool = False,
+        num_keypoints: int = 17,
+    ) -> None:
         self.include_masks = include_masks
         self.cat2label = cat2label
+        self.include_keypoints = include_keypoints
+        self.num_keypoints = num_keypoints
 
     def __call__(self, image: Image.Image, target: Dict[str, Any]) -> Tuple[Image.Image, Dict[str, Any]]:
         w, h = image.size
@@ -282,6 +306,16 @@ class ConvertCoco(object):
                 target["masks"] = torch.zeros((0, h, w), dtype=torch.uint8)
 
             target["masks"] = target["masks"].bool()
+
+        if self.include_keypoints:
+            # Parse COCO keypoints: shape (N, num_keypoints, 3) — (x, y, v)
+            # COCO stores keypoints as a flat list [x0,y0,v0, x1,y1,v1, ...]
+            kpts_list = [
+                obj.get("keypoints", [0] * (self.num_keypoints * 3))
+                for obj in anno
+            ]
+            kpts = torch.as_tensor(kpts_list, dtype=torch.float32).reshape(-1, self.num_keypoints, 3)
+            target["keypoints"] = kpts[keep]
 
         target["orig_size"] = torch.as_tensor([int(h), int(w)])
         target["size"] = torch.as_tensor([int(h), int(w)])
@@ -692,3 +726,95 @@ def build_roboflow_from_coco(image_set: str, args: Any, resolution: int) -> Coco
             remap_category_ids=True,
         )
     return dataset
+
+
+def build_coco_pose(image_set: str, args: Any, resolution: int) -> "CocoDetection":
+    """Build a COCO keypoint (pose) dataset for human pose estimation.
+
+    Uses ``person_keypoints_train2017.json`` / ``person_keypoints_val2017.json`` and
+    only retains person instances that have at least one annotated visible keypoint.
+
+    Args:
+        image_set: Split name: ``"train"`` or ``"val"``.
+        args: Namespace with at minimum a ``dataset_dir`` attribute pointing to the
+            COCO root directory.
+        resolution: Target short-side resolution in pixels.
+
+    Returns:
+        A :class:`CocoDetection` dataset configured for pose estimation.
+
+    Raises:
+        FileNotFoundError: If the COCO root or annotation file does not exist.
+    """
+    root = Path(getattr(args, "dataset_dir", None) or args.coco_path)
+    if not root.exists():
+        logger.error(f"COCO path {root} does not exist")
+        raise FileNotFoundError(f"COCO path {root} does not exist")
+
+    PATHS = {  # noqa: N806
+        "train": (root / "train2017", root / "annotations" / "person_keypoints_train2017.json"),
+        "val": (root / "val2017", root / "annotations" / "person_keypoints_val2017.json"),
+    }
+    img_folder, ann_file = PATHS[image_set.split("_")[0]]
+    if not ann_file.exists():
+        raise FileNotFoundError(
+            f"Pose annotation file not found: {ann_file}. "
+            "Ensure COCO person_keypoints annotations are downloaded."
+        )
+
+    multi_scale = getattr(args, "multi_scale", True)
+    expanded_scales = getattr(args, "expanded_scales", True)
+    patch_size = getattr(args, "patch_size", 16)
+    num_windows = getattr(args, "num_windows", 2)
+    aug_config = getattr(args, "aug_config", None)
+
+    logger.info(f"Building COCO-Pose {image_set} dataset at resolution {resolution}")
+    dataset = CocoDetection(
+        img_folder,
+        ann_file,
+        transforms=make_coco_transforms_square_div_64(
+            image_set,
+            resolution,
+            multi_scale=multi_scale,
+            expanded_scales=expanded_scales,
+            skip_random_resize=False,
+            patch_size=patch_size,
+            num_windows=num_windows,
+            aug_config=aug_config,
+            gpu_postprocess=False,  # Pose always uses CPU transforms
+        ),
+        # Remap sparse COCO category IDs (1=person) to contiguous 0-based indices.
+        remap_category_ids=True,
+        include_keypoints=True,
+        num_keypoints=getattr(args, "num_keypoints", 17),
+    )
+
+    # Filter to images that have at least one non-crowd person annotation with
+    # at least one visible keypoint (v > 0), matching COCO eval protocol.
+    from pycocotools.coco import COCO as _COCO
+
+    coco_api: _COCO = dataset.coco
+    person_cat_ids = coco_api.getCatIds(supNms=["person"])
+    valid_ids = []
+    for img_id in dataset.ids:
+        ann_ids = coco_api.getAnnIds(imgIds=img_id, catIds=person_cat_ids, iscrowd=False)
+        anns = coco_api.loadAnns(ann_ids)
+        for ann in anns:
+            kpts = ann.get("keypoints", [])
+            vis = kpts[2::3]  # every 3rd value starting at index 2
+            if any(v > 0 for v in vis):
+                valid_ids.append(img_id)
+                break
+
+    logger.info(
+        "COCO-Pose %s: keeping %d / %d images with at least 1 person keypoint.",
+        image_set,
+        len(valid_ids),
+        len(dataset.ids),
+    )
+    # Rebuild with filtered IDs by creating a lightweight index-based Subset.
+    id_to_idx = {img_id: i for i, img_id in enumerate(dataset.ids)}
+    valid_indices = [id_to_idx[img_id] for img_id in valid_ids]
+    from torch.utils.data import Subset
+
+    return Subset(dataset, valid_indices)

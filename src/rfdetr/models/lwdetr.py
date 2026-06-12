@@ -42,6 +42,7 @@ from rfdetr.models.criterion import (  # noqa: F401 — backward compat
     sigmoid_focal_loss,
     sigmoid_varifocal_loss,
 )
+from rfdetr.models.heads.pose import PoseHead
 from rfdetr.models.heads.segmentation import SegmentationHead
 from rfdetr.models.matcher import build_matcher
 from rfdetr.models.math import MLP
@@ -95,6 +96,7 @@ class LWDETR(nn.Module):
         two_stage=False,
         lite_refpoint_refine=False,
         bbox_reparam=False,
+        pose_head=None,
     ):
         """Initializes the model.
 
@@ -115,6 +117,7 @@ class LWDETR(nn.Module):
         self.class_embed = nn.Linear(hidden_dim, num_classes)
         self.bbox_embed = MLP(hidden_dim, hidden_dim, 4, 3)
         self.segmentation_head = segmentation_head
+        self.pose_head = pose_head
 
         query_dim = 4
         self.refpoint_embed = nn.Embedding(num_queries * group_detr, query_dim)
@@ -239,14 +242,22 @@ class LWDETR(nn.Module):
             if self.segmentation_head is not None:
                 outputs_masks = seg_head_fwd(features[0].tensors, hs, samples.tensors.shape[-2:])
 
+            if self.pose_head is not None:
+                outputs_kpts, outputs_kpt_vis = self.pose_head(hs)
+
             out = {"pred_logits": outputs_class[-1], "pred_boxes": outputs_coord[-1]}
             if self.segmentation_head is not None:
                 out["pred_masks"] = outputs_masks[-1]
+            if self.pose_head is not None:
+                out["pred_keypoints"] = outputs_kpts[-1]
+                out["pred_kpt_vis"] = outputs_kpt_vis[-1]
             if self.aux_loss:
                 out["aux_outputs"] = self._set_aux_loss(
                     outputs_class,
                     outputs_coord,
                     outputs_masks if self.segmentation_head is not None else None,
+                    outputs_kpts if self.pose_head is not None else None,
+                    outputs_kpt_vis if self.pose_head is not None else None,
                 )
 
         if self.two_stage:
@@ -269,14 +280,25 @@ class LWDETR(nn.Module):
                     skip_blocks=True,
                 )[0]
 
+            if self.pose_head is not None:
+                # Encoder hidden states: [B, N, D] → add layer dim for PoseHead
+                kpts_enc, kpt_vis_enc = self.pose_head(hs_enc.unsqueeze(0))
+                kpts_enc, kpt_vis_enc = kpts_enc[0], kpt_vis_enc[0]  # [B, N, K, 2], [B, N, K]
+
             if hs is not None:
                 out["enc_outputs"] = {"pred_logits": cls_enc, "pred_boxes": ref_enc}
                 if self.segmentation_head is not None:
                     out["enc_outputs"]["pred_masks"] = masks_enc
+                if self.pose_head is not None:
+                    out["enc_outputs"]["pred_keypoints"] = kpts_enc
+                    out["enc_outputs"]["pred_kpt_vis"] = kpt_vis_enc
             else:
                 out = {"pred_logits": cls_enc, "pred_boxes": ref_enc}
                 if self.segmentation_head is not None:
                     out["pred_masks"] = masks_enc
+                if self.pose_head is not None:
+                    out["pred_keypoints"] = kpts_enc
+                    out["pred_kpt_vis"] = kpt_vis_enc
 
         return out
 
@@ -329,17 +351,22 @@ class LWDETR(nn.Module):
             return outputs_coord, outputs_class
 
     @torch.jit.unused
-    def _set_aux_loss(self, outputs_class, outputs_coord, outputs_masks):
+    def _set_aux_loss(self, outputs_class, outputs_coord, outputs_masks, outputs_kpts=None, outputs_kpt_vis=None):
         # this is a workaround to make torchscript happy, as torchscript
         # doesn't support dictionary with non-homogeneous values, such
         # as a dict having both a Tensor and a list.
+        aux = []
+        for a, b in zip(outputs_class[:-1], outputs_coord[:-1]):
+            entry: dict = {"pred_logits": a, "pred_boxes": b}
+            aux.append(entry)
         if outputs_masks is not None:
-            return [
-                {"pred_logits": a, "pred_boxes": b, "pred_masks": c}
-                for a, b, c in zip(outputs_class[:-1], outputs_coord[:-1], outputs_masks[:-1])
-            ]
-        else:
-            return [{"pred_logits": a, "pred_boxes": b} for a, b in zip(outputs_class[:-1], outputs_coord[:-1])]
+            for entry, c in zip(aux, outputs_masks[:-1]):
+                entry["pred_masks"] = c
+        if outputs_kpts is not None:
+            for entry, k, v in zip(aux, outputs_kpts[:-1], outputs_kpt_vis[:-1]):
+                entry["pred_keypoints"] = k
+                entry["pred_kpt_vis"] = v
+        return aux
 
     def _get_backbone_encoder_layers(self) -> Optional[nn.ModuleList]:
         """Resolve the list of transformer blocks/layers from backbone[0].encoder.
@@ -444,6 +471,14 @@ def build_model(args: "BuilderArgs"):
         else None
     )
 
+    _pose_head = getattr(args, "pose_head", False)
+    _num_keypoints = getattr(args, "num_keypoints", 17)
+    built_pose_head = (
+        PoseHead(args.hidden_dim, num_keypoints=_num_keypoints)
+        if _pose_head
+        else None
+    )
+
     model = LWDETR(
         backbone,
         transformer,
@@ -455,11 +490,14 @@ def build_model(args: "BuilderArgs"):
         two_stage=args.two_stage,
         lite_refpoint_refine=args.lite_refpoint_refine,
         bbox_reparam=args.bbox_reparam,
+        pose_head=built_pose_head,
     )
     return model
 
 
 def build_criterion_and_postprocessors(args: "BuilderArgs"):
+    from rfdetr.models.postprocess import PosePostProcess
+
     device = torch.device(args.device)
     matcher = build_matcher(args)
     weight_dict = {"loss_ce": args.cls_loss_coef, "loss_bbox": args.bbox_loss_coef}
@@ -467,6 +505,10 @@ def build_criterion_and_postprocessors(args: "BuilderArgs"):
     if args.segmentation_head:
         weight_dict["loss_mask_ce"] = args.mask_ce_loss_coef
         weight_dict["loss_mask_dice"] = args.mask_dice_loss_coef
+    _pose_head = getattr(args, "pose_head", False)
+    if _pose_head:
+        weight_dict["loss_keypoints"] = getattr(args, "oks_loss_coef", 5.0)
+        weight_dict["loss_kpt_vis"] = getattr(args, "kpt_vis_loss_coef", 1.0)
     # TODO this is a hack
     if args.aux_loss:
         aux_weight_dict = {}
@@ -479,8 +521,11 @@ def build_criterion_and_postprocessors(args: "BuilderArgs"):
     losses = ["labels", "boxes", "cardinality"]
     if args.segmentation_head:
         losses.append("masks")
+    if _pose_head:
+        losses.append("keypoints")
 
     sum_group_losses = getattr(args, "sum_group_losses", False)
+    _num_keypoints = getattr(args, "num_keypoints", 17)
     if args.segmentation_head:
         criterion = SetCriterion(
             args.num_classes + 1,
@@ -494,6 +539,8 @@ def build_criterion_and_postprocessors(args: "BuilderArgs"):
             use_position_supervised_loss=args.use_position_supervised_loss,
             ia_bce_loss=args.ia_bce_loss,
             mask_point_sample_ratio=args.mask_point_sample_ratio,
+            pose_head=_pose_head,
+            num_keypoints=_num_keypoints,
         )
     else:
         criterion = SetCriterion(
@@ -507,9 +554,14 @@ def build_criterion_and_postprocessors(args: "BuilderArgs"):
             use_varifocal_loss=args.use_varifocal_loss,
             use_position_supervised_loss=args.use_position_supervised_loss,
             ia_bce_loss=args.ia_bce_loss,
+            pose_head=_pose_head,
+            num_keypoints=_num_keypoints,
         )
     criterion.to(device)
-    postprocess = PostProcess(num_select=args.num_select)
+    if _pose_head:
+        postprocess = PosePostProcess(num_select=args.num_select, num_keypoints=_num_keypoints)
+    else:
+        postprocess = PostProcess(num_select=args.num_select)
 
     return criterion, postprocess
 
