@@ -45,6 +45,10 @@ class RFDETRModelModule(LightningModule):
 
         # Model, criterion, and postprocessor.
         self.model = build_model_from_config(model_config, train_config)
+        # HuggingFace from_pretrained() leaves the encoder in eval() mode by default.
+        # Explicitly switch the full model to train mode so PTL's fit-loop check does
+        # not warn about eval-mode modules at the start of training.
+        self.model.train()
         if model_config.pretrain_weights is not None:
             # Canonical loader handles PE interpolation, PTL .ckpt normalisation,
             # per-group query slicing, class-name extraction, partial-load warnings,

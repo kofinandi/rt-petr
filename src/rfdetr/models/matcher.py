@@ -25,6 +25,7 @@ from torch import nn
 
 from rfdetr.models.heads.segmentation import point_sample
 from rfdetr.utilities.box_ops import batch_dice_loss, batch_sigmoid_ce_loss, box_cxcywh_to_xyxy, generalized_box_iou
+from rfdetr.utilities.keypoint_ops import COCO_PERSON_SIGMAS, pairwise_oks
 from rfdetr.utilities.logger import get_logger
 
 logger = get_logger()
@@ -50,6 +51,8 @@ class HungarianMatcher(nn.Module):
         mask_point_sample_ratio: int = 16,
         cost_mask_ce: float = 1,
         cost_mask_dice: float = 1,
+        cost_oks: float = 0.0,
+        num_keypoints: int = 17,
     ):
         """Creates the matcher.
 
@@ -63,16 +66,20 @@ class HungarianMatcher(nn.Module):
             mask_point_sample_ratio: Downsampling ratio for mask point sampling.
             cost_mask_ce: Relative weight of the binary cross-entropy mask cost.
             cost_mask_dice: Relative weight of the Dice mask cost.
+            cost_oks: Relative weight of the OKS cost (pose estimation).
+            num_keypoints: Number of keypoints (used for OKS sigmas).
         """
         super().__init__()
         self.cost_class = cost_class
         self.cost_bbox = cost_bbox
         self.cost_giou = cost_giou
-        assert cost_class != 0 or cost_bbox != 0 or cost_giou != 0, "all costs can't be 0"
+        assert cost_class != 0 or cost_bbox != 0 or cost_giou != 0 or cost_oks != 0, "all costs can't be 0"
         self.focal_alpha = focal_alpha
         self.mask_point_sample_ratio = mask_point_sample_ratio
         self.cost_mask_ce = cost_mask_ce
         self.cost_mask_dice = cost_mask_dice
+        self.cost_oks = cost_oks
+        self.num_keypoints = num_keypoints
         self._warned_non_finite_costs = False
 
     @staticmethod
@@ -167,6 +174,15 @@ class HungarianMatcher(nn.Module):
         # Compute the L1 cost between boxes
         cost_bbox = torch.cdist(out_bbox, tgt_bbox, p=1)
 
+        kpts_present = "keypoints" in targets[0] and self.cost_oks > 0 and "pred_keypoints" in outputs
+        if kpts_present:
+            tgt_kpts = torch.cat([v["keypoints"] for v in targets])  # [total_M, K, 3]
+            tgt_areas = torch.cat([v["area"] for v in targets])       # [total_M]
+            out_kpts_xy = outputs["pred_keypoints"].flatten(0, 1)[..., :2]  # [B*Q, K, 2]
+            sigmas = COCO_PERSON_SIGMAS[: self.num_keypoints].to(out_kpts_xy.device)
+            oks_mat = pairwise_oks(out_kpts_xy, tgt_kpts, tgt_areas, sigmas)  # [B*Q, M]
+            cost_oks_mat = -oks_mat
+
         if masks_present:
             tgt_masks = torch.cat([v["masks"] for v in targets])
 
@@ -211,6 +227,8 @@ class HungarianMatcher(nn.Module):
         cost_matrix = self.cost_bbox * cost_bbox + self.cost_class * cost_class + self.cost_giou * cost_giou
         if masks_present:
             cost_matrix = cost_matrix + self.cost_mask_ce * cost_mask_ce + self.cost_mask_dice * cost_mask_dice
+        if kpts_present:
+            cost_matrix = cost_matrix + self.cost_oks * cost_oks_mat
         cost_matrix = (
             cost_matrix.view(bs, num_queries, -1).float().cpu()
         )  # convert to float because bfloat16 doesn't play nicely with CPU
@@ -249,6 +267,9 @@ class HungarianMatcher(nn.Module):
 
 
 def build_matcher(args):
+    pose_head_flag = getattr(args, "pose_head", False)
+    num_keypoints = getattr(args, "num_keypoints", 17)
+    cost_oks = getattr(args, "set_cost_oks", 2.0) if pose_head_flag else 0.0
     if args.segmentation_head:
         return HungarianMatcher(
             cost_class=args.set_cost_class,
@@ -258,6 +279,8 @@ def build_matcher(args):
             cost_mask_ce=args.mask_ce_loss_coef,
             cost_mask_dice=args.mask_dice_loss_coef,
             mask_point_sample_ratio=args.mask_point_sample_ratio,
+            cost_oks=cost_oks,
+            num_keypoints=num_keypoints,
         )
     else:
         return HungarianMatcher(
@@ -265,4 +288,6 @@ def build_matcher(args):
             cost_bbox=args.set_cost_bbox,
             cost_giou=args.set_cost_giou,
             focal_alpha=args.focal_alpha,
+            cost_oks=cost_oks,
+            num_keypoints=num_keypoints,
         )

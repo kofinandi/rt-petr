@@ -787,3 +787,54 @@ class SegmentationTrainConfig(TrainConfig):
     mask_dice_loss_coef: float = 5.0
     cls_loss_coef: float = 5.0
     segmentation_head: bool = True
+
+
+class RFDETRPoseBaseConfig(RFDETRBaseConfig):
+    """Base configuration for RF-DETR pose estimation models.
+
+    Inherits the RF-DETR Base architecture and adds pose-specific flags.
+    Pretrained weights are not set by default (train from scratch with DINOv2 backbone).
+    """
+
+    pose_head: bool = True
+    num_keypoints: int = 17
+    num_classes: int = 1  # person only
+    pretrain_weights: Optional[str] = None
+
+
+class RFDETRPoseSmallConfig(RFDETRSmallConfig):
+    """Small RF-DETR pose model (ViT-Small backbone, res=512)."""
+
+    pose_head: bool = True
+    num_keypoints: int = 17
+    num_classes: int = 1
+    pretrain_weights: Optional[str] = None
+
+
+class PoseTrainConfig(TrainConfig):
+    """Training configuration for pose estimation.
+
+    Extends :class:`TrainConfig` with pose-specific loss coefficients and
+    overrides the ``dataset_file`` default to ``"coco_pose"``.
+    """
+
+    dataset_file: str = "coco_pose"  # type: ignore[assignment]  # widened from Literal
+    square_resize_div_64: bool = True
+    multi_scale: bool = True
+    expanded_scales: bool = True
+
+    # Matcher cost weights
+    set_cost_oks: float = 2.0
+
+    # Loss coefficients
+    oks_loss_coef: float = 5.0
+    kpt_l1_loss_coef: float = 0.5
+    kpt_vis_loss_coef: float = 2.0
+
+    # Keep box losses small; they supervise reference-point anchors
+    bbox_loss_coef: float = 1.0
+    giou_loss_coef: float = 0.5
+
+    # Classification uses IA-BCE quality target
+    ia_bce_loss: bool = True
+    cls_loss_coef: float = 1.0

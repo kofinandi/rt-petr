@@ -58,6 +58,20 @@ class Normalize(object):
             boxes = box_xyxy_to_cxcywh(boxes)
             boxes = boxes / torch.tensor([w, h, w, h], dtype=torch.float32)
             target["boxes"] = boxes
+        # Normalize keypoint coordinates to [0, 1]
+        if "keypoints" in target:
+            kpts = target["keypoints"].clone()  # [N, K, 3]
+            kpts[..., 0] = kpts[..., 0] / w
+            kpts[..., 1] = kpts[..., 1] / h
+            target["keypoints"] = kpts
+        # Normalize area to [0, 1] (used by OKS with normalized coordinates)
+        if "area" in target:
+            area = target["area"]
+            if area.dtype.is_floating_point:
+                # Only normalize if still in pixel-space (values >> 1)
+                # Guard: if already normalized (max <= 2) don't re-normalize
+                if area.numel() > 0 and area.max() > 2.0:
+                    target["area"] = area / (float(h) * float(w))
         return image, target
 
 
@@ -115,6 +129,69 @@ GEOMETRIC_TRANSFORMS = {
 
 # Albumentations container/meta transforms that hold nested transforms
 ALBUMENTATIONS_CONTAINERS = frozenset({"OneOf", "SomeOf", "Sequential"})
+
+# COCO 17-keypoint left-right flip pairs (0-indexed)
+_COCO_FLIP_PAIRS: List[Tuple[int, int]] = [
+    (1, 2),
+    (3, 4),
+    (5, 6),
+    (7, 8),
+    (9, 10),
+    (11, 12),
+    (13, 14),
+    (15, 16),
+]
+
+
+def _contains_hflip(transform: alb.BasicTransform) -> bool:
+    """Return True if the transform (or any nested transform) is a HorizontalFlip.
+
+    Args:
+        transform: Albumentations transform to inspect.
+
+    Returns:
+        ``True`` when a HorizontalFlip is present anywhere in the transform tree.
+    """
+    name = type(transform).__name__
+    if name == "HorizontalFlip":
+        return True
+    transforms_attr = getattr(transform, "transforms", None)
+    if transforms_attr:
+        return any(_contains_hflip(t) for t in transforms_attr)
+    return False
+
+
+def _hflip_was_applied_from_replay(replay: Dict) -> bool:
+    """Detect whether a HorizontalFlip was applied using Albumentations ReplayCompose data.
+
+    Args:
+        replay: The ``replay`` key returned by ``ReplayCompose.__call__``.
+
+    Returns:
+        ``True`` if any HorizontalFlip in the replay tree reports ``applied=True``.
+    """
+    for t in replay.get("transforms", []):
+        if "HorizontalFlip" in t.get("__class_fullname__", "") and t.get("applied", False):
+            return True
+        # Recurse into container transforms
+        if _hflip_was_applied_from_replay(t):
+            return True
+    return False
+
+
+def _apply_kpt_hflip(keypoints: torch.Tensor) -> torch.Tensor:
+    """Swap left/right keypoint pairs after a horizontal flip.
+
+    Args:
+        keypoints: ``[N, K, 3]`` tensor (x, y, vis).  Modified in-place and returned.
+
+    Returns:
+        Same tensor with left/right pairs swapped.
+    """
+    for l_idx, r_idx in _COCO_FLIP_PAIRS:
+        if l_idx < keypoints.shape[1] and r_idx < keypoints.shape[1]:
+            keypoints[:, [l_idx, r_idx]] = keypoints[:, [r_idx, l_idx]]
+    return keypoints
 
 
 def _is_geometric_transform(transform: alb.BasicTransform) -> bool:
@@ -360,23 +437,34 @@ class AlbumentationsWrapper:
     def __init__(self, transform: alb.BasicTransform) -> None:
         # Auto-detect if transform is geometric (recursively for containers)
         self._is_geometric = _is_geometric_transform(transform)
+        # Detect if this transform (or a container within it) is a HorizontalFlip
+        self._has_hflip = _contains_hflip(transform)
 
         if self._is_geometric:
-            # Wrap geometric transform with bbox handling capabilities
-            # bbox_params configure how Albumentations should transform bounding boxes:
-            self.transform = alb.Compose(
-                [transform],
+            # Wrap geometric transform with bbox + keypoint handling capabilities.
+            # Use ReplayCompose so we can detect which transforms were applied
+            # (needed for left-right keypoint pair swapping after HorizontalFlip).
+            _compose_cls = getattr(alb, "ReplayCompose", alb.Compose)
+            compose_kwargs: dict = dict(
                 bbox_params=alb.BboxParams(
                     format="pascal_voc",  # Boxes are in (x1, y1, x2, y2) format
                     label_fields=["category_ids", "idxs"],  # Track labels and indices for per-instance field sync
                     min_visibility=0.0,  # Remove boxes with zero visibility/area after transformation
                     clip=True,  # Clip box coordinates to image boundaries after transformation
                 ),
+                keypoint_params=alb.KeypointParams(
+                    format="xy",
+                    remove_invisible=False,  # Keep out-of-bounds keypoints; we mark them invisible manually
+                    label_fields=["kpt_ids"],
+                ),
             )
+            self.transform = _compose_cls([transform], **compose_kwargs)
+            self._use_replay = _compose_cls is not alb.Compose
         else:
             # Wrap non-geometric transform without bbox handling
             # Simpler composition since boxes don't need transformation
             self.transform = alb.Compose([transform])
+            self._use_replay = False
 
     def __repr__(self) -> str:
         """Return a readable string representation of the wrapper.
@@ -501,6 +589,21 @@ class AlbumentationsWrapper:
                 raise ValueError(f"masks must have shape (N, H, W), got {masks_np.shape}")
             masks_np = masks_np.astype(np.uint8, copy=False)
             masks_list = [mask for mask in masks_np]
+
+        # Prepare keypoints for Albumentations: flatten [N, K, 3] → list of (x, y) with
+        # label ids (instance_idx * K + keypoint_idx) for reconstruction.
+        kpts_flat: List[Tuple[float, float]] = []
+        kpt_ids_flat: List[int] = []
+        has_keypoints = "keypoints" in target and target["keypoints"].numel() > 0
+        if has_keypoints:
+            kpts_tensor = target["keypoints"]  # [num_ann, num_kpts, 3]
+            num_ann, num_kpts, _ = kpts_tensor.shape
+            for i in range(num_ann):
+                for k in range(num_kpts):
+                    x, y, _ = kpts_tensor[i, k].tolist()
+                    kpts_flat.append((float(x), float(y)))
+                    kpt_ids_flat.append(i * num_kpts + k)
+
         # Filter out degenerate boxes (zero-width or zero-height) before passing to
         # Albumentations. Such boxes arise when an annotation sits exactly on or beyond
         # the image boundary so that x_min == x_max (or y_min == y_max) after clipping.
@@ -515,10 +618,20 @@ class AlbumentationsWrapper:
                 # can correctly slice fields from the un-filtered target.
                 idxs = [idxs[i] for i in valid_positions]
         # Apply transform
-        transform_kwargs = {"image": image_np, "bboxes": boxes_np, "category_ids": labels, "idxs": idxs}
+        transform_kwargs = {
+            "image": image_np,
+            "bboxes": boxes_np,
+            "category_ids": labels,
+            "idxs": idxs,
+        }
         if masks_list is not None and len(masks_list) > 0:
             transform_kwargs["masks"] = masks_list
+        # Always supply keypoints/kpt_ids since the compose is configured with
+        # keypoint_params(label_fields=["kpt_ids"]); empty lists when absent.
+        transform_kwargs["keypoints"] = kpts_flat
+        transform_kwargs["kpt_ids"] = kpt_ids_flat
         augmented = self.transform(**transform_kwargs)
+
         target_out: Dict[str, Any] = target.copy()
         bboxes_aug = augmented["bboxes"]
         kept_idxs = augmented.get("idxs", idxs)
@@ -531,6 +644,10 @@ class AlbumentationsWrapper:
             if "masks" in target:
                 aug_height, aug_width = augmented["image"].shape[:2]
                 target_out["masks"] = torch.zeros((0, aug_height, aug_width), dtype=torch.bool)
+            if has_keypoints:
+                target_out["keypoints"] = torch.zeros(
+                    (0, target["keypoints"].shape[1], 3), dtype=torch.float32
+                )
         else:
             target_out["boxes"] = torch.as_tensor(bboxes_aug, dtype=torch.float32).reshape(-1, 4)
             target_out["labels"] = torch.tensor(augmented["category_ids"], dtype=torch.long)
@@ -540,6 +657,15 @@ class AlbumentationsWrapper:
             if "area" in target_out:
                 boxes = target_out["boxes"]
                 target_out["area"] = (boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1])
+            if has_keypoints:
+                aug_h, aug_w = augmented["image"].shape[:2]
+                target_out["keypoints"] = self._reconstruct_keypoints(
+                    augmented,
+                    target["keypoints"],
+                    kept_idxs,
+                    aug_h,
+                    aug_w,
+                )
         image_out = Image.fromarray(augmented["image"])
         if masks_list is not None and "masks" in augmented:
             height, width = augmented["image"].shape[:2]
@@ -549,7 +675,67 @@ class AlbumentationsWrapper:
                 target_out["masks"] = torch.zeros((0, height, width), dtype=torch.bool)
             else:
                 target_out["masks"] = torch.as_tensor(np.stack(masks_aug), dtype=torch.bool)
+
+        # After HorizontalFlip: swap left/right keypoint pairs so anatomical labels stay correct.
+        if has_keypoints and self._has_hflip and "keypoints" in target_out:
+            hflip_applied = False
+            if self._use_replay and "replay" in augmented:
+                hflip_applied = _hflip_was_applied_from_replay(augmented["replay"])
+            if hflip_applied and target_out["keypoints"].numel() > 0:
+                target_out["keypoints"] = _apply_kpt_hflip(target_out["keypoints"].clone())
+
         return image_out, target_out
+
+    @staticmethod
+    def _reconstruct_keypoints(
+        augmented: Dict[str, Any],
+        orig_keypoints: torch.Tensor,
+        kept_idxs: List[int],
+        aug_h: int,
+        aug_w: int,
+    ) -> torch.Tensor:
+        """Reconstruct a ``[N_kept, K, 3]`` keypoints tensor from Albumentations output.
+
+        Albumentations returns keypoints as a flat list of ``(x, y)`` tuples and their
+        corresponding ``kpt_ids`` labels.  Keypoints that Albumentations moved outside the
+        image boundary are absent from the output list; we mark those as invisible (vis=0).
+
+        Args:
+            augmented: Result dict from the Albumentations transform (must contain
+                ``"keypoints"`` and ``"kpt_ids"`` entries).
+            orig_keypoints: Original keypoints ``[N_all, K, 3]`` (x, y, vis).
+            kept_idxs: Instance indices kept after box-based filtering.
+            aug_h: Output image height (pixels).
+            aug_w: Output image width (pixels).
+
+        Returns:
+            ``[n_kept, num_kpts, 3]`` float32 tensor with updated coordinates and visibility.
+        """
+        n_kept = len(kept_idxs)
+        num_kpts = orig_keypoints.shape[1]
+        out = torch.zeros((n_kept, num_kpts, 3), dtype=torch.float32)
+
+        kpts_aug = augmented.get("keypoints", [])
+        ids_aug = augmented.get("kpt_ids", [])
+
+        for xy, flat_id in zip(kpts_aug, ids_aug):
+            # Albumentations may return label_fields values as floats; cast to int.
+            fid = int(flat_id)
+            orig_inst = fid // num_kpts
+            k_idx = fid % num_kpts
+            if orig_inst not in kept_idxs:
+                continue
+            new_inst = kept_idxs.index(orig_inst)
+            x_new, y_new = float(xy[0]), float(xy[1])
+            # Clip to image bounds and check if still inside
+            if 0 <= x_new <= aug_w and 0 <= y_new <= aug_h:
+                orig_vis = orig_keypoints[orig_inst, k_idx, 2].item()
+                out[new_inst, k_idx, 0] = x_new
+                out[new_inst, k_idx, 1] = y_new
+                out[new_inst, k_idx, 2] = orig_vis
+            # else: keypoint is outside image bounds, keep as zero (vis=0, not labeled)
+
+        return out
 
     def __call__(
         self, image: PIL.Image.Image, target: Optional[Dict[str, Any]]
@@ -600,8 +786,10 @@ class AlbumentationsWrapper:
         if target is None:
             image_np = np.array(image)
             if self._is_geometric:
-                # Geometric A.Compose requires label_fields even when there are no boxes
-                augmented = self.transform(image=image_np, bboxes=[], category_ids=[], idxs=[])
+                # Geometric A.Compose requires label_fields even when there are no boxes/keypoints
+                augmented = self.transform(
+                    image=image_np, bboxes=[], category_ids=[], idxs=[], keypoints=[], kpt_ids=[]
+                )
             else:
                 augmented = self.transform(image=image_np)
             return Image.fromarray(augmented["image"]), None

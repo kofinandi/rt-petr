@@ -34,6 +34,7 @@ class PostProcess(nn.Module):
         """
         out_logits, out_bbox = outputs["pred_logits"], outputs["pred_boxes"]
         out_masks = outputs.get("pred_masks", None)
+        out_kpts = outputs.get("pred_keypoints", None)  # [B, Q, K, 3]
 
         assert len(out_logits) == len(target_sizes)
         assert target_sizes.shape[1] == 2
@@ -50,6 +51,17 @@ class PostProcess(nn.Module):
         img_h, img_w = target_sizes.unbind(1)
         scale_fct = torch.stack([img_w, img_h, img_w, img_h], dim=1)
         boxes = boxes * scale_fct[:, None, :]
+
+        # Scale keypoints from normalized to absolute pixel coordinates
+        if out_kpts is not None:
+            kpts_xy = out_kpts[..., :2]   # [batch, queries, K, 2] normalized
+            kpts_vis = out_kpts[..., 2]   # [batch, queries, K] logit
+            # scale x by img_w, y by img_h
+            scale_kpts = torch.stack([img_w, img_h], dim=1)  # [B, 2]
+            kpts_xy_abs = kpts_xy * scale_kpts[:, None, None, :]  # [B, Q, K, 2]
+            kpts_vis_score = kpts_vis.sigmoid()  # [B, Q, K]
+            # Combine back: [B, Q, K, 3]
+            out_kpts_abs = torch.cat([kpts_xy_abs, kpts_vis_score.unsqueeze(-1)], dim=-1)
 
         # Optionally gather masks corresponding to the same top-K queries and resize to original size
         results = []
@@ -70,6 +82,24 @@ class PostProcess(nn.Module):
                     align_corners=False,
                 )  # [K,1,H,W]
                 res_i["masks"] = masks_i > 0.0
+                if out_kpts is not None:
+                    kpts_i = torch.gather(
+                        out_kpts_abs[i],
+                        0,
+                        k_idx.unsqueeze(-1).unsqueeze(-1).expand(-1, out_kpts_abs.shape[2], 3),
+                    )  # [K_sel, K_kpts, 3]
+                    res_i["keypoints"] = kpts_i
+                results.append(res_i)
+        elif out_kpts is not None:
+            for i, (score, label, box) in enumerate(zip(scores, labels, boxes)):
+                res_i = {"scores": score, "labels": label, "boxes": box}
+                k_idx = topk_boxes[i]
+                kpts_i = torch.gather(
+                    out_kpts_abs[i],
+                    0,
+                    k_idx.unsqueeze(-1).unsqueeze(-1).expand(-1, out_kpts_abs.shape[2], 3),
+                )  # [K_sel, K_kpts, 3]
+                res_i["keypoints"] = kpts_i
                 results.append(res_i)
         else:
             results = [

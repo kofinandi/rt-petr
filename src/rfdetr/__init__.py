@@ -55,6 +55,8 @@ from rfdetr.variants import (
     RFDETRLargeDeprecated,  # DEPRECATED # noqa: F401
     RFDETRMedium,
     RFDETRNano,
+    RFDETRPose,
+    RFDETRPoseSmall,
     RFDETRSeg2XLarge,
     RFDETRSegLarge,
     RFDETRSegMedium,
@@ -78,6 +80,8 @@ __all__ = [
     "RFDETRSegLarge",
     "RFDETRSegXLarge",
     "RFDETRSeg2XLarge",
+    "RFDETRPose",
+    "RFDETRPoseSmall",
 ]
 
 

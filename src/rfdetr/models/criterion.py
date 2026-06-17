@@ -21,6 +21,7 @@ from rfdetr.models.heads.segmentation import (
 from rfdetr.models.math import accuracy
 from rfdetr.utilities import box_ops
 from rfdetr.utilities.distributed import get_world_size, is_dist_avail_and_initialized
+from rfdetr.utilities.keypoint_ops import COCO_PERSON_SIGMAS, oks_loss
 
 
 def sigmoid_focal_loss(inputs, targets, num_boxes, alpha: float = 0.25, gamma: float = 2):
@@ -146,6 +147,7 @@ class SetCriterion(nn.Module):
         use_position_supervised_loss=False,
         ia_bce_loss=False,
         mask_point_sample_ratio: int = 16,
+        num_keypoints: int = 17,
     ):
         """Create the criterion.
 
@@ -169,6 +171,7 @@ class SetCriterion(nn.Module):
         self.use_position_supervised_loss = use_position_supervised_loss
         self.ia_bce_loss = ia_bce_loss
         self.mask_point_sample_ratio = mask_point_sample_ratio
+        self.num_keypoints = num_keypoints
 
     def loss_labels(self, outputs, targets, indices, num_boxes, log=True):
         """Classification loss (Binary focal loss) targets dicts must contain the key "labels" containing a tensor of
@@ -463,12 +466,73 @@ class SetCriterion(nn.Module):
         tgt_idx = torch.cat([tgt for (_, tgt) in indices])
         return batch_idx, tgt_idx
 
+    def loss_keypoints(self, outputs, targets, indices, num_boxes):
+        """Compute keypoint losses for matched prediction–target pairs.
+
+        Three components:
+        - OKS loss (1 - OKS): the primary keypoint quality signal.
+        - L1 loss on visible keypoints.
+        - Binary cross-entropy on visibility logits.
+
+        Args:
+            outputs: Model output dict; must contain ``"pred_keypoints"``
+                of shape ``[B, Q, K, 3]`` (x, y normalized, vis logit).
+            targets: List of target dicts; each must contain ``"keypoints"``
+                of shape ``[N, K, 3]`` and ``"area"`` of shape ``[N]``.
+            indices: Hungarian matching indices.
+            num_boxes: Normalization denominator (total matched boxes).
+
+        Returns:
+            Dict with keys ``"loss_oks"``, ``"loss_kpt_l1"``, ``"loss_kpt_vis"``.
+        """
+        if "pred_keypoints" not in outputs:
+            # Encoder outputs do not have a pose head; return zero losses.
+            zero = outputs["pred_logits"].sum() * 0.0
+            return {"loss_oks": zero, "loss_kpt_l1": zero, "loss_kpt_vis": zero}
+
+        idx = self._get_src_permutation_idx(indices)
+        src_kpts = outputs["pred_keypoints"][idx]  # [N_matched, K, 3]
+        tgt_kpts = torch.cat(
+            [t["keypoints"][j] for t, (_, j) in zip(targets, indices)], dim=0
+        )  # [N_matched, K, 3]
+        tgt_areas = torch.cat(
+            [t["area"][j] for t, (_, j) in zip(targets, indices)], dim=0
+        )  # [N_matched]
+
+        if src_kpts.numel() == 0:
+            zero = src_kpts.sum()
+            return {"loss_oks": zero, "loss_kpt_l1": zero, "loss_kpt_vis": zero}
+
+        src_xy = src_kpts[..., :2]   # [N, K, 2]
+        tgt_xy = tgt_kpts[..., :2].to(src_xy.device)  # [N, K, 2]
+        vis = tgt_kpts[..., 2].to(src_xy.device)       # [N, K]
+        vis_mask = (vis > 0).float()                    # labeled keypoints
+
+        # OKS loss
+        sigmas = COCO_PERSON_SIGMAS[: self.num_keypoints].to(src_kpts.device)
+        loss_oks = oks_loss(src_xy, tgt_kpts.to(src_kpts.device), tgt_areas.to(src_kpts.device), sigmas)
+
+        # L1 loss on labeled keypoints
+        kpt_l1 = F.l1_loss(src_xy, tgt_xy, reduction="none").sum(-1)  # [N, K]
+        n_vis = vis_mask.sum().clamp(min=1)
+        loss_kpt_l1 = (kpt_l1 * vis_mask).sum() / (n_vis * num_boxes) * src_xy.shape[0]
+
+        # Visibility BCE: target = 1 if vis==2 (labeled & visible), 0 otherwise
+        src_vis_logit = src_kpts[..., 2]                      # [N, K]
+        tgt_vis_bin = (vis > 1.0).float()                     # [N, K]
+        loss_kpt_vis = F.binary_cross_entropy_with_logits(
+            src_vis_logit, tgt_vis_bin, reduction="mean"
+        )
+
+        return {"loss_oks": loss_oks, "loss_kpt_l1": loss_kpt_l1, "loss_kpt_vis": loss_kpt_vis}
+
     def get_loss(self, loss, outputs, targets, indices, num_boxes, **kwargs):
         loss_map = {
             "labels": self.loss_labels,
             "cardinality": self.loss_cardinality,
             "boxes": self.loss_boxes,
             "masks": self.loss_masks,
+            "keypoints": self.loss_keypoints,
         }
         assert loss in loss_map, f"do you really want to compute {loss} loss?"
         return loss_map[loss](outputs, targets, indices, num_boxes, **kwargs)

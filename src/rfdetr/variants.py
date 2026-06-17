@@ -27,17 +27,22 @@ __all__ = [
     "RFDETRSegLarge",
     "RFDETRSegXLarge",
     "RFDETRSeg2XLarge",
+    "RFDETRPose",
+    "RFDETRPoseSmall",
 ]
 
 from deprecate import deprecated_class
 
 from rfdetr.config import (
     ModelConfig,
+    PoseTrainConfig,
     RFDETRBaseConfig,
     RFDETRLargeConfig,
     RFDETRLargeDeprecatedConfig,
     RFDETRMediumConfig,
     RFDETRNanoConfig,
+    RFDETRPoseBaseConfig,
+    RFDETRPoseSmallConfig,
     RFDETRSeg2XLargeConfig,
     RFDETRSegLargeConfig,
     RFDETRSegMediumConfig,
@@ -222,3 +227,23 @@ class RFDETRSegXLarge(RFDETRSeg):
 class RFDETRSeg2XLarge(RFDETRSeg):
     size = "rfdetr-seg-2xlarge"
     _model_config_class = RFDETRSeg2XLargeConfig
+
+
+class RFDETRPose(RFDETR):
+    """Base class for RF-DETR pose estimation models.
+
+    Uses :class:`~rfdetr.config.PoseTrainConfig` by default, which sets
+    ``dataset_file="coco_pose"`` and pose-specific loss coefficients.
+    Train from scratch (DINOv2 backbone weights only) by default.
+    """
+
+    _train_config_class = PoseTrainConfig
+    _model_config_class = RFDETRPoseBaseConfig
+    size = "rfdetr-pose-base"
+
+
+class RFDETRPoseSmall(RFDETRPose):
+    """RF-DETR Small pose estimation model (ViT-Small backbone, res=512)."""
+
+    _model_config_class = RFDETRPoseSmallConfig
+    size = "rfdetr-pose-small"

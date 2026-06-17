@@ -31,6 +31,7 @@ from rfdetr.training.callbacks import (
     RFDETREMACallback,
 )
 from rfdetr.training.callbacks.coco_eval import COCOEvalCallback
+from rfdetr.training.callbacks.pose_eval import PoseEvalCallback
 from rfdetr.utilities.logger import get_logger
 
 _logger = get_logger()
@@ -163,16 +164,30 @@ def build_trainer(
             "%s → spawn-based DDP to avoid OpenMP thread pool corruption after fork.",
             tc.strategy,
         )
-    elif strategy == "ddp" and model_config.segmentation_head:
-        # The segmentation head's sparse_forward() returns dict intermediates and
-        # leaves some parameters unused on certain forward steps, causing DDP to
-        # raise "It looks like your LightningModule has parameters that were not
-        # used in producing the loss" with plain ddp.  Enabling
-        # find_unused_parameters lets DDP traverse the autograd graph after each
-        # backward pass to detect which parameters contributed to the loss.
+    elif strategy in ("auto", "ddp") and (model_config.segmentation_head or getattr(model_config, "pose_head", False)):
+        # Some heads leave parameters unused on certain forward steps, causing DDP
+        # to raise "parameters that were not used in producing the loss" with plain
+        # ddp.  Enabling find_unused_parameters lets DDP traverse the autograd graph
+        # after each backward pass to detect which parameters contributed to the loss.
+        #
+        # Segmentation: sparse_forward() returns dict intermediates, leaving some
+        # parameters unused on certain forward steps.
+        #
+        # Pose: the two-stage encoder auxiliary path runs without a pose head, so
+        # the pose-head parameters do not contribute to the encoder aux loss on
+        # every step.
+        #
+        # When strategy="auto" PTL resolves to DDP for multi-GPU runs; we must
+        # override it explicitly here because DDP's find_unused_parameters default
+        # is False and PTL will not inspect our model to set it automatically.
+        # Overriding with an explicit DDPStrategy is safe even for single-GPU: PTL
+        # accepts DDPStrategy with one device (minor overhead, not broken).
         strategy = _DDPStrategy(find_unused_parameters=True)
+        head = "segmentation_head" if model_config.segmentation_head else "pose_head"
         _logger.info(
-            "segmentation_head=True with strategy='ddp' → DDPStrategy(find_unused_parameters=True).",
+            "%s=True with strategy=%r → DDPStrategy(find_unused_parameters=True).",
+            head,
+            tc.strategy,
         )
     sharded = any(s in str(strategy).lower() for s in ("fsdp", "deepspeed"))
     enable_ema = bool(tc.use_ema) and not sharded
@@ -206,14 +221,18 @@ def build_trainer(
         callbacks.append(DropPathCallback(drop_path=tc.drop_path))
 
     # COCO mAP + F1 evaluation.
-    callbacks.append(
-        COCOEvalCallback(
-            max_dets=tc.eval_max_dets,
-            segmentation=model_config.segmentation_head,
-            eval_interval=tc.eval_interval,
-            log_per_class_metrics=tc.log_per_class_metrics,
+    pose_head_flag = getattr(model_config, "pose_head", False)
+    if pose_head_flag:
+        callbacks.append(PoseEvalCallback(eval_interval=tc.eval_interval))
+    else:
+        callbacks.append(
+            COCOEvalCallback(
+                max_dets=tc.eval_max_dets,
+                segmentation=model_config.segmentation_head,
+                eval_interval=tc.eval_interval,
+                log_per_class_metrics=tc.log_per_class_metrics,
+            )
         )
-    )
 
     # Latest resume checkpoint — overwritten every epoch.
     # Skip when checkpoint_interval == 1 to avoid duplicate ModelCheckpoint state_key.

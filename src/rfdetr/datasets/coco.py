@@ -611,6 +611,151 @@ def build_coco(image_set: str, args: Any, resolution: int) -> CocoDetection:
     return dataset
 
 
+class ConvertCocoPose(ConvertCoco):
+    """Convert raw COCO person keypoint annotations into model-ready tensors.
+
+    Extends :class:`ConvertCoco` to also load the ``keypoints`` field from each
+    annotation.  All instances are treated as the single ``person`` class (label 0).
+
+    The returned target dict includes the standard detection fields plus:
+
+    - ``"keypoints"`` – ``(N, K, 3)`` float32 tensor of (x_abs, y_abs, vis).
+      Visibility: 0 = not labeled, 1 = labeled occluded, 2 = labeled visible.
+    """
+
+    def __init__(self, num_keypoints: int = 17) -> None:
+        super().__init__(include_masks=False, cat2label={1: 0})
+        self.num_keypoints = num_keypoints
+
+    def __call__(self, image: Image.Image, target: Dict[str, Any]) -> Tuple[Image.Image, Dict[str, Any]]:
+        image, tgt = super().__call__(image, target)
+
+        anno = target["annotations"]
+        anno = [obj for obj in anno if "iscrowd" not in obj or obj["iscrowd"] == 0]
+
+        # Rebuild keep mask matching parent's degenerate-box filter
+        boxes_raw = [obj["bbox"] for obj in anno]
+        if len(boxes_raw) == 0:
+            tgt["keypoints"] = torch.zeros((0, self.num_keypoints, 3), dtype=torch.float32)
+            return image, tgt
+
+        boxes = torch.as_tensor(boxes_raw, dtype=torch.float32).reshape(-1, 4)
+        boxes[:, 2:] += boxes[:, :2]
+        w_img, h_img = image.size
+        boxes[:, 0::2].clamp_(min=0, max=w_img)
+        boxes[:, 1::2].clamp_(min=0, max=h_img)
+        keep = (boxes[:, 3] > boxes[:, 1]) & (boxes[:, 2] > boxes[:, 0])
+
+        kpts_list = []
+        for obj in anno:
+            raw = obj.get("keypoints", [0] * (self.num_keypoints * 3))
+            kpts_list.append(torch.tensor(raw, dtype=torch.float32).view(self.num_keypoints, 3))
+        keypoints = torch.stack(kpts_list, dim=0)  # [N, K, 3]
+        tgt["keypoints"] = keypoints[keep]
+        return image, tgt
+
+
+class CocoKeypointDetection(CocoDetection):
+    """COCO keypoints dataset filtered to instances with annotated keypoints.
+
+    Wraps :class:`CocoDetection` with :class:`ConvertCocoPose` as the converter
+    and filters ``self.ids`` to images that have at least *min_kpt_anns* annotations
+    with ``num_keypoints > 0``.
+
+    Args:
+        img_folder: Path to image directory.
+        ann_file: Path to ``person_keypoints_*.json`` annotation file.
+        transforms: Transform pipeline applied after annotation conversion.
+        min_kpt_anns: Minimum number of annotations with visible keypoints
+            required to include an image in the dataset.
+    """
+
+    def __init__(
+        self,
+        img_folder: Union[str, Path],
+        ann_file: Union[str, Path],
+        transforms: Optional[Any],
+        min_kpt_anns: int = 1,
+    ) -> None:
+        # bypass ConvertCoco constructor — we set our own prepare below
+        super().__init__(img_folder, ann_file, transforms, include_masks=False, remap_category_ids=False)
+        self.prepare = ConvertCocoPose()
+        # Map COCO label2cat for evaluator: label 0 → category_id 1 (person)
+        self.cat2label = {1: 0}
+        self.label2cat = {0: 1}
+        setattr(self.coco, "label2cat", self.label2cat)
+        # Filter to images with keypoint annotations
+        valid_ids = []
+        for img_id in self.ids:
+            anns = self.coco.loadAnns(self.coco.getAnnIds(imgIds=img_id))
+            if any(a.get("num_keypoints", 0) >= min_kpt_anns for a in anns):
+                valid_ids.append(img_id)
+        self.ids = valid_ids
+        logger.info(
+            f"CocoKeypointDetection: kept {len(self.ids)} images "
+            f"(min_kpt_anns={min_kpt_anns}) from {ann_file}"
+        )
+
+
+def build_coco_pose(image_set: str, args: Any, resolution: int) -> CocoKeypointDetection:
+    """Build a COCO person keypoints dataset.
+
+    Loads ``person_keypoints_{split}2017.json`` from *dataset_dir* and wraps it
+    with :class:`CocoKeypointDetection` + keypoint-aware transforms.  Always uses
+    ``augmentation_backend="cpu"`` (GPU/Kornia keypoint support is not implemented).
+
+    Args:
+        image_set: ``"train"`` or ``"val"``.
+        args: Namespace with at least ``dataset_dir``, ``multi_scale``,
+            ``expanded_scales``, ``do_random_resize_via_padding``, ``patch_size``,
+            ``num_windows``, ``aug_config``, ``square_resize_div_64``.
+        resolution: Target resolution in pixels.
+
+    Returns:
+        :class:`CocoKeypointDetection` ready to be used in a DataLoader.
+    """
+    root = Path(getattr(args, "dataset_dir", None) or args.coco_path)
+    if not root.exists():
+        raise FileNotFoundError(f"COCO path {root} does not exist")
+
+    PATHS = {  # noqa: N806
+        "train": (root / "train2017", root / "annotations" / "person_keypoints_train2017.json"),
+        "val": (root / "val2017", root / "annotations" / "person_keypoints_val2017.json"),
+    }
+    img_folder, ann_file = PATHS[image_set.split("_")[0]]
+    aug_config = getattr(args, "aug_config", None)
+    square_resize_div_64 = getattr(args, "square_resize_div_64", True)
+
+    # Pose training always uses CPU augmentation (GPU/Kornia keypoint support deferred)
+    if square_resize_div_64:
+        transforms = make_coco_transforms_square_div_64(
+            image_set,
+            resolution,
+            multi_scale=getattr(args, "multi_scale", True),
+            expanded_scales=getattr(args, "expanded_scales", True),
+            skip_random_resize=not getattr(args, "do_random_resize_via_padding", False),
+            patch_size=getattr(args, "patch_size", 16),
+            num_windows=getattr(args, "num_windows", 2),
+            aug_config=aug_config,
+            gpu_postprocess=False,
+        )
+    else:
+        transforms = make_coco_transforms(
+            image_set,
+            resolution,
+            multi_scale=getattr(args, "multi_scale", True),
+            expanded_scales=getattr(args, "expanded_scales", True),
+            skip_random_resize=not getattr(args, "do_random_resize_via_padding", False),
+            patch_size=getattr(args, "patch_size", 16),
+            num_windows=getattr(args, "num_windows", 2),
+            aug_config=aug_config,
+            gpu_postprocess=False,
+        )
+
+    logger.info(f"Building COCO pose {image_set} dataset at resolution {resolution}")
+    return CocoKeypointDetection(img_folder, ann_file, transforms)
+
+
 def _resolve_runtime_augmentation_backend(backend: str) -> str:
     """Resolve ``augmentation_backend`` at runtime for dataset builders.
 

@@ -49,6 +49,9 @@ _MC_NAMESPACE_FIELDS = {
     "sa_nheads",
     "segmentation_head",
     "two_stage",
+    # Pose-estimation fields (present only on RFDETRPose* configs)
+    "pose_head",
+    "num_keypoints",
 }
 
 # TrainConfig fields NOT forwarded to the legacy namespace.
@@ -138,6 +141,17 @@ def _namespace_from_configs(
         else mc.cls_loss_coef
     )
 
+    # Pose configs may add fields not present on the base ModelConfig (e.g. pose_head,
+    # num_keypoints).  model_dump(include=...) silently skips missing keys, so we fall
+    # back to getattr with safe defaults for fields that are only present on subclasses.
+    mc_fields = set(_MC_NAMESPACE_FIELDS)
+    mc_dump = mc.model_dump(include=mc_fields & set(mc.model_fields))
+    # Ensure pose fields are always present in the namespace (default to "off").
+    if "pose_head" not in mc_dump:
+        mc_dump["pose_head"] = getattr(mc, "pose_head", False)
+    if "num_keypoints" not in mc_dump:
+        mc_dump["num_keypoints"] = getattr(mc, "num_keypoints", 17)
+
     return types.SimpleNamespace(
         **{
             # Architectural defaults — 35 constants not exposed in ModelConfig/TrainConfig.
@@ -148,11 +162,19 @@ def _namespace_from_configs(
             **tc.model_dump(include=set(_TC_NAMESPACE_FIELDS)),
             # ModelConfig: wins over tc for overlapping architecture params
             # (group_detr, ia_bce_loss, segmentation_head, num_select).
-            **mc.model_dump(include=set(_MC_NAMESPACE_FIELDS)),
+            **mc.model_dump(include=set(_MC_NAMESPACE_FIELDS) & set(mc.model_fields)),
+            # Always-present pose + seg extras (subclass-only, absent from base configs).
+            "pose_head": mc_dump["pose_head"],
+            "num_keypoints": mc_dump["num_keypoints"],
             # Segmentation extras (SegmentationTrainConfig only — absent from base TrainConfig).
             "mask_ce_loss_coef": getattr(tc, "mask_ce_loss_coef", 5.0),
             "mask_dice_loss_coef": getattr(tc, "mask_dice_loss_coef", 5.0),
             "mask_point_sample_ratio": getattr(tc, "mask_point_sample_ratio", 16),
+            # Pose extras (PoseTrainConfig only — absent from base TrainConfig).
+            "set_cost_oks": getattr(tc, "set_cost_oks", 2.0),
+            "oks_loss_coef": getattr(tc, "oks_loss_coef", 5.0),
+            "kpt_l1_loss_coef": getattr(tc, "kpt_l1_loss_coef", 0.5),
+            "kpt_vis_loss_coef": getattr(tc, "kpt_vis_loss_coef", 2.0),
             # Transformations: fields requiring a default sentinel or transitional priority.
             "cls_loss_coef": cls_loss_coef,
             "resume": tc.resume or "",
